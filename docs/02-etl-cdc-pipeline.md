@@ -262,6 +262,12 @@ Indexing phải tách:
 
 MCP audit event được ghi durable trước, publish qua outbox; write tool bắt buộc authorization ở LMS tại execution time. Warehouse không được cấp quyền gọi ngược tool.
 
+### Local-knowledge privacy
+
+File local được MCP client đọc không phải nguồn dữ liệu của BDC và không được đưa vào warehouse. BDC chỉ quan sát được MCP calls thực sự đến server. Không log local path, filename, source alias, file hash, excerpt, prompt hoặc nội dung draft chưa gửi.
+
+Nếu client tự nguyện khai báo context, telemetry chỉ được phép giữ controlled fields như `knowledge_mode = LMS_ONLY | LOCAL_ONLY | HYBRID` và `local_context_used = true`; đây là client claim, không phải bằng chứng BDC đã đọc file. Khi giáo viên duyệt một derived Markdown lesson, warehouse ghi business event tạo lesson và MCP attribution như bình thường, nhưng không suy diễn hay lưu fingerprint của source file local.
+
 ## 12. Failure and replay runbook
 
 1. Sink lỗi: application tiếp tục; Kafka giữ event trong retention.
