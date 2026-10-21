@@ -1,184 +1,223 @@
-# Source coverage, Kafka capacity và implementation roadmap
+# Source coverage, capacity, and implementation roadmap
 
-## 1. Inventory từ CoreApplication tại 2026-08-31
+Owner: BDC Hub platform/data team with service owners and DevOps.
+Status: planning inventory and rollout gates, not production deployment evidence.
 
-### Hạ tầng
+The initial project foundation and bounded live-source commands are now
+implemented; use [the active setup](05-bigquery-setup.md) for observed deployment
+status. The phases below describe the broader target, not completed milestones.
 
-- K3s single node.
-- Kafka 3.7 KRaft, 1 broker, auto-create topic, default 3 partitions.
-- Kafka heap 512 MiB–1 GiB; request 0.5 CPU/1 GiB; limit 2 CPU/2 GiB; PVC 10 GiB.
-- Kafka internal replication factor 1: không chịu được broker/PVC loss.
-- PostgreSQL production host là Neon pooled endpoint; nhiều logical DB cho Auth/LMS/Lab/Chat/AI.
-- Personalize dùng DuckDB/PVC; không được xem là warehouse bền vững.
+## 1. Inventory and evidence
 
-### Existing Kafka coverage
+The original inventory date is **2026-08-31**. Documentation was revised on
+**2026-10-21**. Treat historical observations separately from checked-in settings;
+measure the live system before choosing production capacity.
 
-| Domain | Existing signals found | Gap |
+### Infrastructure
+
+The [Kafka manifest](../../k3s/base/kafka-statefulset.yaml) defines Kafka 3.7 KRaft,
+one broker, topic auto-creation, three default partitions, a `512 MiB–1 GiB`
+heap, `0.5 CPU/1 GiB` request, `2 CPU/2 GiB` limit, and `10 GiB` PVC. Internal
+replication factor is one; broker/PVC loss is not tolerated by this topology.
+The original deployment inventory describes one K3s node and Neon PostgreSQL
+with pooled application endpoints. Revalidate both before rollout.
+
+Personalize owns DuckDB/Parquet analytics and profiles. It is not a replacement
+for a durable, governed warehouse. Consult the implementation-backed
+[Data Platform guide](../../docs/DATA_PLATFORM.md) before assuming a topic exists.
+
+### Existing signals and gaps
+
+| Domain | Source evidence/surface | Remaining work |
 |---|---|---|
-| LMS | `learning-events`, `lms.analytics.interactions`, `lms.document.uploaded`, `lms.ai.command`, maintenance/graph commands | login/course enrollment/content lifecycle producer chưa đồng bộ chuẩn envelope |
-| AI | `ai.document.processed.status`, `ai.job.status`, `ai.graph.status`, `ai.graph.node_merged` | per-user LLM context, embedding batches, studio usage |
-| Lab | `lab.job.command`, `lab.job.status`, `lab.session.checkpoint`, `lab.session.idle` | documented analytics publication incomplete; submission/task completion envelope |
-| Personalize | consumes analytics/login/course/recommender; publishes profile/notification | một số consumed topics chưa thấy producer đáng tin cậy |
-| Recommender | `recommender.interactions.v1` | standardized impression→outcome attribution |
-| Auth | notification consumer | login/session/security activity producer |
-| Chat | DB/Redis realtime | metadata analytics producer |
-| MCP | PostgreSQL `mcp_audit_log` | Kafka/outbox, latency/correlation/client/tool version |
+| LMS | Learning events, micro-interactions, document/AI/graph/maintenance commands | Standard enrollment/content lifecycle events and consistent context |
+| AI | Document/job/graph status and node merge events | Per-user LLM context, durable usage, embedding/Studio telemetry |
+| Lab | Job/session constants and consumers | Verify actual runtime publishers; add submission/task completion contracts |
+| Personalize | Analytics/recommendation consumers, profile/notification producers | Some accepted topics have no confirmed producer |
+| Recommender | `recommender.interactions.v1` | Standardized impression/outcome attribution in warehouse |
+| Auth | Notification consumption | Interactive login/session/security telemetry |
+| Chat | Database/Redis messaging | Metadata analytics publication |
+| MCP | Audit table and tool adapter | Durable event publication, correlation, latency, client/tool version |
 
-## 2. Source-to-target coverage matrix
+For the initial slice, `lms.analytics.interactions` and
+`recommender.interactions.v1` have implemented producer/consumer contracts.
+`user.login.events`, `lms.analytics.telemetry`, and `lms.course.interactions`
+remain consumer-only gaps until a producer and end-to-end test are demonstrated.
+The separate learning worker consumes `learning-events`; verify producer semantics
+and compatibility before adding it. Commands/status signals are not automatically
+complete analytical facts, and declared topic constants are not publication evidence.
 
-| Source entity/event | Capture | Warehouse target | Priority |
+## 2. Source-to-target plan
+
+Priority expresses analytical importance, not implementation order. The existing
+LMS/recommendation slice comes first; selective CDC waits until Phase 3.
+
+| Source | Capture | Warehouse target | Priority |
 |---|---|---|---|
-| Auth users/roles/org | CDC + snapshot | `dim_user`, membership bridge, `dim_organization` | P0 |
-| Interactive login attempt | domain event/outbox | `fact_login_attempt` | P0 |
-| Auth session lifecycle | event + state snapshot | `fact_session` | P1 |
-| LMS course/section/content | CDC + domain publish events | content dimensions | P0 |
-| Enrollment mutation | outbox | accumulating enrollment fact | P0 |
-| Learning/micro interaction | existing event normalized | content/feature facts | P0 |
-| Quiz/question/answer | outbox/CDC selected | quiz/question dims and attempt/response facts | P1 |
-| Lab/lab version/task | CDC selected | lab dimensions | P0 |
-| Lab session/submission/test result | existing + outbox | lab facts | P0 |
-| HPC job/resource | runtime event | HPC fact | P1 |
-| Chat channel/member/message metadata | outbox | chat facts/bridge | P1 |
-| Recommendation impression/outcome | existing contract upgrade | recommendation facts | P1 |
-| AI model/task config | CDC selected | AI dimensions | P0 |
-| LLM attempt | source migration + outbox/CDC | LLM attempt fact | P0 |
-| Agent turn/session/feedback | outbox/CDC selected | agent facts | P1 |
-| Index/embedding/VLM/rerank | instrument job pipeline | index/embedding facts | P0 |
-| Studio generation/export | instrument job pipeline | studio fact | P1 |
-| MCP key lifecycle/tool call | outbox | MCP facts | P0 |
-| Personalize skill/profile state | event + daily snapshot/export | skill evidence/snapshot | P1 |
+| Auth users, roles, organizations | Source-owned snapshot, then selective CDC | User/org dimensions and membership bridge | P0 |
+| Interactive login attempt | Durable domain event/outbox as required | Login attempt fact | P0 |
+| Session lifecycle | Events and state snapshots | Session fact | P1 |
+| Courses, sections, content | Snapshot, publish events, later CDC | Content/course dimensions | P0 |
+| Enrollment mutation | Outbox | Enrollment lifecycle fact | P0 |
+| Learning/micro-interaction | Existing event adapter | Content/feature facts | P0 |
+| Quiz, question, response | Outbox or selected CDC | Dimensions and attempt/response facts | P1 |
+| Labs, versions, tasks | Snapshot, later selected CDC | Lab dimensions | P0 |
+| Lab session, submission, test results | Verified runtime events/outbox | Lab facts | P0 |
+| HPC resource/job | Runtime event | HPC fact | P1 |
+| Chat/channel membership metadata | Outbox | Chat facts/bridge | P1 |
+| Recommendation impression/outcome | Existing contract | Recommendation facts | P1 |
+| AI models and tasks | Snapshot, later selected CDC | AI dimensions | P0 |
+| LLM attempt | Context/durability migration, then outbox/selected CDC | Attempt fact | P0 |
+| Agent turn/session/feedback | Outbox/selected CDC | Agent facts | P1 |
+| Indexing, embeddings, VLM, reranking | Instrument job pipeline | Index/embedding facts | P0 |
+| Studio generation/export | Instrument job pipeline | Studio fact | P1 |
+| MCP key lifecycle/tool calls | Owning-service outbox | MCP facts | P0 |
+| Skill/profile state | Events and approved daily exports | Skill evidence/snapshots | P1 |
 
 ## 3. Kafka capacity model
 
-Không dùng estimate cố định nếu chưa đo. Dùng:
+Use observed encoded sizes, compression, and fan-out rather than a fixed forecast:
 
 ```text
-ingress_bytes_day = events_day × avg_encoded_event_bytes × producer_overhead
-retained_bytes    = ingress_bytes_day × retention_days × replication_factor
-                     × compression_ratio × safety_factor
-network_bytes_sec ≈ event_rate × avg_bytes × (producer + consumer copies)
+ingress_bytes_day = events_day * mean_encoded_event_bytes * framing_multiplier
+retained_bytes    = ingress_bytes_day * retention_days * replication_factor
+                    * stored_compression_fraction * safety_factor
+network_bytes_sec ~= event_rate * encoded_bytes * producer_and_consumer_copies
 ```
 
-Với broker hiện tại replication factor = 1. `compression_ratio` dùng kích thước sau nén (ví dụ 0.3–0.7), safety factor ít nhất 1.5 cho segment/index/retry/spike. Cộng internal topics và headroom; không cho Kafka PVC vượt 70% steady-state trên node từng DiskPressure.
+The stored compression fraction is compressed/uncompressed size, for example
+0.3–0.7. Use an initial safety factor of at least 1.5, then include internal topics,
+segment/index overhead, retries, and burst headroom explicitly. Consumer groups
+increase network reads; partition count alone does not describe load.
 
-### Planning scenarios — chỉ dùng để sizing trước khi có metrics
+### Illustrative scenarios
 
-Giả định payload trung bình 1.5 KiB sau envelope, compression 0.5, safety 1.5, retention 3 ngày:
+Assume 1.5 KiB encoded payloads, framing multiplier 1, compression fraction 0.5,
+safety factor 1.5, replication factor 1, and three days of retention:
 
-| Events/day | Avg rate | Peak 20× | Estimated retained analytics data |
+| Events/day | Mean rate | 20× peak rate | Estimated retained analytics data |
 |---:|---:|---:|---:|
-| 100,000 | 1.2/s | 23/s | ~0.32 GiB |
-| 1,000,000 | 11.6/s | 232/s | ~3.14 GiB |
-| 5,000,000 | 57.9/s | 1,158/s | ~15.7 GiB |
+| 100,000 | 1.2/s | 23/s | 0.32 GiB |
+| 1,000,000 | 11.6/s | 232/s | 3.22 GiB |
+| 5,000,000 | 57.9/s | 1,158/s | 16.09 GiB |
 
-Scenario 1M/day đã chiếm phần đáng kể PVC 10 GiB sau khi cộng existing topics/internal logs; do đó sampling/batching UI telemetry và giảm retention là bắt buộc trước scale. Throughput CPU không phải rủi ro đầu tiên; disk/retention và single-broker durability mới là rủi ro chính.
+These are sizing examples, not measured traffic or total PVC usage. One million
+events/day already consumes a material share of the 10 GiB PVC before existing
+and internal topics. Disk and replay durability may fail before CPU throughput.
+Keep steady-state Kafka PVC utilization below the proposed 70% target.
 
-### Resource recommendation Phase 1
+### Phase 1 tuning candidates
 
-Không tăng Kafka một cách mù quáng. Trước tiên:
+- Collect bytes/messages in/out, partition lag age, request latency, log size,
+  offline partitions, PVC usage, and disk growth for at least seven days.
+- Set explicit topic partitions/retention rather than relying on auto-create defaults.
+- Start analytics retention at 24–72 hours and DLQ at seven days with byte caps.
+- Benchmark LZ4/Zstd producer compression.
+- Start the sink near `100m CPU/128 MiB` request and `500m CPU/512 MiB` limit;
+  these are test candidates, not proven resource requirements.
+- Try 500–5,000 events per batch or a 1–5 minute flush, with an independent byte
+  limit. Check per-table load-job quotas before choosing batch-load cadence.
+- Alert at proposed PVC thresholds of 60/70/80%, plus lag age and growth slope.
+- Preserve 25–30% free space; image/log cleanup must not delete Kafka data.
 
-- bật exporter/JMX metrics: bytes in/out, messages in, request latency, under-replicated/offline partitions, log size;
-- topic explicit config, không phụ thuộc auto-create default 3 partitions;
-- analytics retention 24–72 giờ; DLQ 7 ngày với volume cap;
-- LZ4/Zstd producer compression;
-- consumer sink request `100m CPU/128 MiB`, limit `500m CPU/512 MiB`, benchmark rồi sửa;
-- sink batch 500–5,000 events hoặc 1–5 phút, bounded memory;
-- cảnh báo Kafka PVC 60/70/80%, lag age và disk growth slope;
-- giữ ít nhất 25–30% root/PVC free; image/log cleanup không được xóa Kafka data.
+If throughput or recovery requirements exceed this topology, evaluate funded
+managed transport or additional brokers. Extending retention on a full disk is
+not a scaling strategy. Any telemetry sampling must preserve metric definitions
+and must never silently remove core business/cost events.
 
-Nếu measured sustained rate vượt khả năng hoặc cần HA, chuyển transport sang managed Kafka/Pub/Sub có ngân sách; không tăng retention trên root disk.
+## 4. Warehouse storage and query budget
 
-## 4. Storage budget model
-
-So sánh free 10 GiB với **retained logical bytes**, không phải riêng “GB phát sinh mỗi tháng”. Ví dụ 3.7 GiB dữ liệu mới/tháng và giữ 12 tháng có thể thành ~44 GiB trước compression/expiration, vượt free storage.
-
-Mỗi table phải có:
+Estimate storage using retained logical bytes under the selected billing model:
 
 ```text
-rows/day × logical bytes/row × retention days
+retained_logical_bytes = rows_per_day * mean_logical_bytes_per_row * retention_days
+query_workload_bytes  = sum(bytes_scanned_per_run * runs_per_period)
 ```
 
-Budget Phase 1 đề xuất:
+Include every retained layer, snapshots, replay artifacts, quarantine, and the
+selected storage model's time-travel/fail-safe behavior. Compressed Parquet file
+size is not the same as BigQuery logical storage. For example, 3.7 GiB of new data
+per month retained for twelve months is about 44.4 GiB before deletion/aggregation,
+not 3.7 GiB. Recheck current allowances rather than embedding them as guarantees.
 
-- raw 30 ngày, sampling high-volume events;
-- core transaction facts 13 tháng;
-- SCD dimensions theo policy;
-- marts 25 tháng nếu nhỏ;
-- chat/MCP/AI payload chỉ metadata;
-- monthly job báo storage by table và forecast 30/90 ngày.
+Initial policy proposals are raw for 30 days, staging for 7–30 days, core facts
+for thirteen months, and small daily marts for up to twenty-five months. SCD and
+identity retention need domain/privacy review. Keep Chat/MCP/AI analytics to
+approved metadata. Forecast table storage and query spend for 30/90 days; use
+daily checks initially and a monthly policy review.
 
-Nếu forecast vượt free tier: giảm raw retention, aggregate older facts, export cold Parquet sang storage có policy phù hợp, hoặc chấp nhận ngân sách trả phí. Không silent drop core facts.
+When forecast exceeds budget, consider shorter raw retention, approved telemetry
+aggregation, cold exports with lifecycle rules, or an explicit paid budget. Cold
+storage has its own access/transfer/operation costs and deletion obligations.
 
 ## 5. Implementation phases
 
-### Phase 0 — contracts và governance (repository này)
+### Phase 0: contracts and foundation
 
-1. Chốt ADR, model, metric definitions, privacy/retention.
-2. Đo baseline Kafka/DB/event volume 7 ngày.
-3. Tạo GCP dev project, IAM, budgets, datasets bằng IaC.
-4. Viết contract tests và source/target catalog.
+1. Agree on architecture, grains, metric definitions, privacy, and retention.
+2. Measure source traffic and Kafka/DB capacity over seven days.
+3. Prepare a development GCP project, identities, cost controls, and datasets.
+4. Define source/target catalogs and executable contract test requirements.
 
-Exit: architecture review accepted; không còn P0 data owner/privacy question.
+Exit: architecture review completed and unresolved P0 ownership/privacy questions
+identified and resolved for the initial slice. See [setup](05-bigquery-setup.md).
 
-### Phase 1 — vertical slice, không CDC
+### Phase 1: one complete slice, without CDC
 
-1. Deploy raw tables/governance tables.
-2. Build lightweight sink với existing `lms.analytics.interactions` và `recommender.interactions.v1`.
-3. Standardize event envelope and dedupe.
-4. Build `dim_date`, `dim_feature`, minimal `dim_user/course` snapshots.
-5. Produce one end-to-end mart and reconciliation dashboard.
+1. Implement raw/governance DDL and the loader.
+2. Consume existing LMS micro-interaction and recommendation topics using a new group.
+3. Normalize event identity and prove deduplication/replay behavior.
+4. Add date/feature dimensions and source-owned minimal user/course snapshots.
+5. Deliver one daily learning-activity mart and reconciliation report.
 
-Exit: replay test, duplicate test, quota failure test, source count reconciliation pass.
+Exit: duplicate, replay, quarantine, rebalance, quota-failure, and source-count
+checks pass; freshness and cost are measured. Missing historical context remains
+explicit rather than being fabricated.
 
-### Phase 2 — actor/context telemetry và outbox
+### Phase 2: actor/context telemetry and outbox
 
-1. Add Auth login/session event.
-2. Add LMS enrollment/content outbox.
-3. Add Lab submission/task/HPC events.
-4. Add Chat metadata outbox.
-5. Extend `llm_usage_log` context and MCP audit.
-6. Implement AI/index/MCP facts and daily marts.
+Add Auth login/session events, LMS enrollment/content outbox, verified Lab events,
+Chat metadata outbox, AI usage context/durability, and MCP audit correlation.
+Build AI/indexing/MCP facts and daily marts after source contracts are ready.
 
-Exit: per-user AI/MCP cost traces from UI action → tool/job → every LLM attempt.
+Exit: a user action can be traced to its tool/job and every attributable provider
+attempt, with a documented loss/reconciliation policy.
 
-### Phase 3 — selective CDC/SCD2
+### Phase 3: selective CDC and SCD2
 
-1. Snapshot selected dimensions.
-2. Enable Neon logical replication in controlled maintenance window.
-3. Deploy one connector first; monitor scale-to-zero, egress and WAL.
-4. Validate late/out-of-order SCD timeline.
-5. Expand allowlist only after capacity/privacy review.
+Start with one source-owned dimension snapshot/connector, schedule Neon changes
+with its owner, monitor compute/network/WAL impact, and validate late/out-of-order
+history. Expand the allowlist only after capacity/privacy review.
 
-Exit: restore/slot loss/re-snapshot runbook tested.
+Exit: slot loss, restore, source delete, resnapshot, and timeline repair runbooks
+have been exercised without assuming an always-complete Kafka history.
 
-### Phase 4 — complete marts and optimization
+### Phase 4: broader marts and measured optimization
 
-1. User/course/content/lab/chat/AI/MCP marts.
-2. Cohort, funnel, retention, feature adoption and cost attribution.
-3. Aggregate/expire based on measured cost.
-4. Row/column security for instructor/org/admin analytics.
+Add user/course/content/Lab/Chat/AI/MCP marts, cohorts, funnels, retention, feature
+adoption, and cost attribution. Tune aggregation/expiration from actual workloads
+and add the instructor/organization/admin access policies each use case needs.
+Use the [optimization playbook](06-data-engineering-optimization.md).
 
 ## 6. Acceptance criteria
 
-- A user action is traceable by request/trace ID across domain, MCP/AI job and LLM attempts.
-- Login exact time and daily login definition are independently testable.
-- Query “user/course state at event time” resolves đúng SCD version.
-- Duplicate/replay produces identical core result.
-- Warehouse outage does not fail application requests.
-- Kafka lag recovers before retention deadline under peak scenario.
-- No secrets/raw restricted payload found by privacy tests.
-- Every dashboard metric links to a versioned definition and owner.
-- Daily reconciliation variance is within explicit threshold.
-- Cost guardrails demonstrably prevent unbounded scans and stop pipeline on quota/budget signal.
+- Trace IDs connect domain actions, tools/jobs, and provider attempts where promised.
+- Exact login time and reporting-day login definitions are independently testable.
+- Historical fact joins resolve the correct SCD version at event time.
+- Duplicate replay produces equivalent core results.
+- Analytics failures do not fail application requests.
+- Recovery throughput clears lag before source retention expires.
+- Restricted payloads and secrets are excluded before persistence.
+- Each dashboard metric has a versioned definition and owner.
+- Reconciliation differences remain within an explicit, explained tolerance.
+- Query limits, retention, alerts, and analytics stop/resume behavior are tested;
+  nobody treats budget notification as an exact monetary cap.
 
-## 7. Open inputs before production
+## 7. Inputs required before production
 
-Các input này không chặn việc viết foundation nhưng phải chốt trước Phase 1 go-live:
-
-- GCP project/billing owner và organization IAM.
-- Data retention/consent/legal basis, đặc biệt learner/chat/AI telemetry.
-- Expected DAU, peak concurrent users và 7-day measured event volume.
-- BigQuery region cuối cùng nếu data residency yêu cầu ngoài Singapore.
-- Dashboard freshness SLO: 1, 5 hay 15 phút.
-- RPO/RTO cho analytics và mức chấp nhận loss khi single Kafka broker hỏng.
-- Model provider price source và currency conversion policy.
+Development and metadata/contract verification can proceed while these are being
+resolved. Continuous production ingestion needs a project owner, the selected
+billing mode, organization IAM constraints,
+retention/consent policy, measured volume, confirmed region/residency, freshness
+SLO, analytics RPO/RTO, single-broker loss tolerance, and historical provider price
+and currency-conversion sources.

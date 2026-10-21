@@ -1,63 +1,110 @@
 # BDC Hub Data Warehouse
 
-Kho thiết kế và, ở các phase tiếp theo, mã nguồn cho Data Warehouse của BDC Hub.
+Owner: BDC Hub platform/data team.
 
-Mục tiêu là tạo một lớp dữ liệu phân tích có lịch sử, có thể trả lời được:
+This directory contains warehouse architecture, deployment code, and the initial
+live-data BigQuery models. The warehouse is intended to
+answer historical questions across Auth, LMS, Lab, Chat, AI, Personalize,
+Recommender, and MCP:
 
-- ai đã làm gì, ở đâu, khi nào và kết quả ra sao trên Auth, LMS, Lab, Chat, AI, Personalize, Recommender và MCP;
-- trạng thái user/course/content/lab tại đúng thời điểm sự kiện xảy ra;
-- mức sử dụng từng tính năng, phiên đăng nhập, funnel học tập và cohort;
-- token, latency, model, fallback và chi phí của từng LLM call, AI job, indexing job, agent session và MCP tool call;
-- số liệu vận hành có thể đối soát với database nguồn mà không biến warehouse thành source of truth.
+- Who performed an action, on which resource, when, and with what result?
+- What was the user, course, content, or lab state when the action occurred?
+- How do feature adoption, interactive logins, learning funnels, and cohorts evolve?
+- What tokens, latency, models, retries, fallbacks, and costs belong to each LLM
+  attempt, AI/indexing job, agent session, and MCP tool call?
+- Can analytical totals be reconciled with their owning operational services?
 
-## Trạng thái
+## Implementation status
 
-Repository đang ở **Phase 0 — architecture contract**. Chưa có pipeline nào được triển khai hoặc kết nối production.
+**Initial live-data foundation:** project `bdc-web-487000`, region
+`asia-southeast1`, with billing disabled at the owner's request. Five datasets,
+one raw LMS table, and four logical staging/core/mart/quality views were deployed
+and verified on 2026-10-21. Source capture and batch-load commands are implemented;
+the first real batch of 205 LMS events has been loaded and reconciled. Recurring
+ingestion, historical backfill, and a persistent SCD2 model are not deployed. See
+[observed deployment evidence](docs/deployment-status.md).
 
-Các tài liệu nền tảng:
+The active [billing-disabled decision](../docs/adr/2026-10-21-bigquery-billing-disabled-foundation.md)
+supersedes ADR-001's billing assumption for this project. Resources expire under
+Sandbox rules; this initial slice must not be presented as permanent history.
+Only real source captures are loaded, without sample rows or invented dimensions.
 
-1. [Tech stack decision](docs/01-tech-stack-decision.md)
-2. [ETL/ELT and CDC pipeline](docs/02-etl-cdc-pipeline.md)
-3. [Dimensional modelling](docs/03-data-warehouse-modelling.md)
-4. [Source coverage, Kafka capacity and rollout](docs/04-source-coverage-capacity-roadmap.md)
+The existing DuckDB/Parquet pipeline in `personalize-service` is a separate,
+implemented analytics/profile boundary. See the
+[Data Platform guide](../docs/DATA_PLATFORM.md) for its current contracts.
 
-## Quyết định tóm tắt
+## Reading order
 
-- Target: **Google BigQuery**, dataset tại `asia-southeast1`, billing-enabled free tier với budget/alert/quotas. BigQuery Sandbox chỉ dùng demo, không dùng production.
-- Pattern: **ELT**, raw append-only → staging → conformed dimensions/facts → marts.
-- Delivery: domain event + transactional outbox cho nghiệp vụ mới; CDC có chọn lọc cho dimension/backfill/reconciliation.
-- Ingestion ban đầu: micro-batch 1–5 phút; không dựng Kafka Connect/Debezium nặng trên node K3s đang thiếu disk.
-- Semantics: at-least-once transport + idempotent event keys + deterministic `MERGE`, tạo hiệu quả exactly-once ở warehouse.
-- Privacy: raw chat body, source code, bearer/API key, prompt/response và IP nguyên bản không được đưa vào analytics warehouse mặc định.
-- Cost: “0 đồng” là budget objective, không phải guarantee. Pipeline phải dừng/fail closed trước khi vượt guardrail.
+| Document | Purpose |
+|---|---|
+| [Technology decision](docs/01-tech-stack-decision.md) | Platform choice, constraints, security, and cost controls |
+| [Pipeline design](docs/02-etl-cdc-pipeline.md) | Events, outbox, selective CDC, ingestion, replay, and failures |
+| [Warehouse modelling](docs/03-data-warehouse-modelling.md) | Fact grains, dimensions, SCD, marts, and metric contracts |
+| [Coverage and rollout](docs/04-source-coverage-capacity-roadmap.md) | Source gaps, sizing, implementation phases, and acceptance criteria |
+| [BigQuery setup](docs/05-bigquery-setup.md) | Active project, authentication, deployment, real source capture, and recovery |
+| [Engineering optimization](docs/06-data-engineering-optimization.md) | Measurement, ingestion, SQL, storage, and recovery trade-offs |
+| [Continuous deployment](docs/07-continuous-deployment.md) | Keyless identities, durable worker, CI/CD, retries, and runtime verification |
 
-## Nguyên tắc bất biến
+For agent-assisted design and implementation, use the repository
+[`bdc-data-engineering` skill](../.agents/skills/bdc-data-engineering/SKILL.md).
 
-1. PostgreSQL của service vẫn là operational source of truth.
-2. Kafka là transport/replay buffer, không phải kho lưu lịch sử vĩnh viễn.
-3. Raw zone bất biến; transformation có thể chạy lại.
-4. Mọi fact phải có grain, event time, ingestion time, source và idempotency key.
-5. Không suy diễn `user_id` của AI call bằng timestamp; context phải được truyền xuyên suốt request/job.
-6. SCD chỉ áp dụng khi lịch sử thuộc tính có giá trị phân tích; không SCD2 mọi cột.
-7. Schema, PII classification, retention và owner phải được khai báo trước khi onboard nguồn mới.
+## Architecture decisions
 
-## Cấu trúc dự kiến
+- Use Google BigQuery in `asia-southeast1`. The active project keeps billing
+  disabled and uses batch loads/logical views with Sandbox retention limits.
+  The broader billing-enabled architecture remains a future option, not an action
+  authorized by current project setup.
+- Use ELT: append-only raw landing, typed staging, conformed dimensions/facts,
+  and purpose-built marts. Apply validation and privacy filtering before raw landing.
+- Use domain events and transactional outbox for new business mutations;
+  selective CDC supports dimensions, backfills, and reconciliation in Phase 3.
+- Start with a lightweight Kafka consumer and 1–5 minute micro-batches. Avoid
+  adding Kafka Connect/Debezium to a disk-constrained K3s node before measurement.
+- Accept at-least-once delivery; produce repeatable core results through stable
+  event keys, source versions, and deterministic transformations.
+- Exclude raw chat, learner code, bearer/API keys, prompts/responses, and raw IP
+  addresses from default warehouse ingestion.
+- Treat near-zero cost as a budget objective. Alerts alone cannot enforce a
+  spending cap; use quotas, bounded queries, retention, and pipeline stop controls.
+
+## Invariants
+
+1. Each service remains the owner and operational source of truth for its data.
+2. Kafka is a transport/replay buffer, not permanent historical storage.
+3. Raw records are immutable under normal processing; controlled privacy erasure
+   and retention still apply. Transformations must be reproducible.
+4. Every fact declares its grain, event time, ingestion time, source, and idempotency key.
+5. AI attribution must propagate actor/context through requests and jobs; never
+   infer a user from timestamp proximity.
+6. Apply SCD only where attribute history has analytical value.
+7. Declare schema, privacy class, retention, and ownership before onboarding a source.
+
+## Implementation and planned layout
+
+`config/`, `ddl/`, `scripts/`, and `transforms/` now contain the initial implementation.
+Additional contracts and automated service components will be added when needed.
 
 ```text
 data-warehouse/
-├── docs/                    # ADR, modelling, runbook
-├── contracts/               # JSON Schema/Protobuf event contracts
-├── ddl/                     # BigQuery datasets/tables/policies
-├── transforms/              # SQL/Dataform transformations and tests
-├── sink/                    # lightweight Kafka -> BigQuery loader
-├── migrations/              # source telemetry/outbox migrations
-└── tests/                   # contract, data quality, replay tests
+├── docs/                    # architecture decisions, modelling, setup, runbooks
+├── config/                  # project/mode configuration, no credentials
+├── contracts/               # versioned event schemas
+├── ddl/                     # BigQuery datasets, tables, and policies
+├── transforms/              # SQL/Dataform models and data tests
+├── scripts/                 # deployment, real source capture, batch load
+├── sink/                    # lightweight Kafka-to-BigQuery loader
+└── tests/                   # contract, quality, replay, and integration tests
 ```
 
-## Điều kiện bắt đầu Phase 1
+Operational migrations belong in the owning service's migration directory, not
+in the warehouse directory.
 
-- Có GCP project, billing account, budget alert và service account tối thiểu quyền.
-- Chốt retention theo lớp dữ liệu và chính sách consent/xóa dữ liệu.
-- Đo Kafka bytes-in, bytes-out, consumer lag, PVC used bytes và event rate ít nhất 7 ngày.
-- Bổ sung actor/context cho `llm_usage_log` và telemetry cho MCP trước khi ingest.
-- Xác nhận location của BigQuery và các thành phần trung gian cùng region.
+## Before the Phase 1 production rollout
+
+- Assign a GCP project/billing owner; configure budgets and workload identities.
+- Agree on layer retention, access, consent, and erasure requirements.
+- Measure Kafka traffic, lag, event rate, and PVC usage for at least seven days.
+- Keep related datasets and any intermediate storage in the selected region.
+- Validate one end-to-end mart using existing LMS/recommendation events.
+- Complete actor/context and MCP telemetry work before onboarding those sources;
+  this does not block the initial LMS/recommendation development slice.

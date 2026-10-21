@@ -1,167 +1,207 @@
-# ADR-001: Serverless warehouse và processing stack
+# ADR-001: Serverless warehouse and processing stack
 
-- Status: Accepted for Phase 0
-- Date: 2026-08-31
+- Status: Accepted for Phase 0; implementation is planned
+- Original decision date: 2026-08-31
+- Documentation revision: 2026-10-21
 - Owners: BDC Hub platform/data team
-- Scope: analytical storage, ingestion, transformation, orchestration, catalog and cost controls
+- Scope: analytical storage, ingestion, transformation, orchestration, catalog, and cost controls
 
-## 1. Context và ràng buộc thực tế
+The project owner's later [billing-disabled decision](../../docs/adr/2026-10-21-bigquery-billing-disabled-foundation.md)
+supersedes this ADR's billing-enabled assumption for `bdc-web-487000`. The active
+initial slice uses real-event batch loads and logical views; the larger SCD/CDC
+architecture below remains planned. See the [current setup](05-bigquery-setup.md).
 
-BDC Hub chạy nhiều service trên một node K3s. Kafka hiện là một KRaft broker, JVM heap `512 MiB–1 GiB`, request `0.5 CPU/1 GiB`, limit `2 CPU/2 GiB`, PVC `10 GiB`, replication factor `1`. Node từng gặp DiskPressure nên không được đặt warehouse database, Kafka Connect cluster hoặc object lake dài hạn lên node này.
+## 1. Context and constraints
 
-Operational PostgreSQL đang dùng Neon qua pooled endpoint. Các domain chính là Auth, LMS, Lab, Chat và AI. Personalize có DuckDB cục bộ; Recommender phát Kafka event. Warehouse phải rẻ, serverless, tách tải khỏi K3s và vẫn hỗ trợ lịch sử SCD, semi-structured events, partition pruning và SQL chuẩn.
+BDC Hub's K3s manifests define a single Kafka KRaft broker with a
+`512 MiB–1 GiB` JVM heap, `0.5 CPU/1 GiB` request, `2 CPU/2 GiB` limit,
+`10 GiB` PVC, and internal replication factor `1`. See
+[the Kafka manifest](../../k3s/base/kafka-statefulset.yaml). These are repository
+settings, not a live capacity measurement. Historical disk pressure makes the
+node unsuitable for a permanent warehouse database, a full Kafka Connect cluster,
+or a long-lived object lake.
 
-“0 đồng” được hiểu là **design target trong free allowance**, không phải SLA về giá. Free tier, currency, egress và quota có thể đổi; hệ thống phải có cảnh báo và kill switch.
+The original operational inventory uses Neon PostgreSQL through pooled endpoints
+for Auth, LMS, Lab, Chat, and AI. Revalidate the deployment inventory before
+provisioning connectors. Personalize already has a local DuckDB/Parquet pipeline;
+Recommender publishes Kafka events. The warehouse must isolate analytical load
+from application infrastructure while supporting SCD history, semi-structured
+events, partition pruning, and SQL.
+
+Near-zero cost means operating within measured allowances where possible, not a
+pricing guarantee. Recheck current pricing, currency, egress, and quotas before
+rollout. Configure alerts and stop controls.
 
 ## 2. Decision drivers
 
-Theo thứ tự ưu tiên:
+In priority order:
 
-1. Không dùng disk/compute thường trực trên K3s.
-2. Hỗ trợ dimensional model, window functions, `MERGE`, partition và clustering.
-3. Có đường đi từ vài GB đến hàng trăm GB mà không redesign toàn bộ.
-4. Chi phí ban đầu gần 0 và đo/khóa được chi phí.
-5. Vận hành ít, backup/HA do cloud quản lý.
-6. Ingest batch lẫn near-real-time, có idempotency và replay.
-7. IAM, audit, row/column policy và tách PII.
-8. Developer workflow bằng SQL, Git và CI.
+1. Avoid permanent warehouse storage/compute on K3s.
+2. Support dimensional modelling, window functions, `MERGE`, partitions, and clustering.
+3. Grow from a few GB to hundreds of GB without redesigning the platform.
+4. Keep initial cost low and observable, with explicit operating limits.
+5. Minimize database administration and infrastructure maintenance.
+6. Support batch and near-real-time ingestion with idempotency and replay.
+7. Provide IAM, audit, row/column controls, and PII separation.
+8. Use SQL, Git, and CI for development and review.
 
-## 3. Các lựa chọn
+## 3. Alternatives considered
 
-| Lựa chọn | Phù hợp | Không phù hợp | Kết luận |
+These are architecture trade-offs, not current vendor price quotations.
+
+| Option | Strengths | Limitations in this project | Decision |
 |---|---|---|---|
-| BigQuery | Serverless thật; columnar; partition/cluster; `MERGE`; free usage cho storage/query; load job shared pool miễn phí; IAM/policy tốt | Cần billing để dùng DML/streaming lâu dài; query/egress sai có thể phát sinh phí | **Chọn** |
-| BigQuery Sandbox | Không cần thẻ; phù hợp POC | Table tự hết hạn sau 60 ngày; không streaming, DML hoặc Data Transfer Service; không chạy được SCD2 production | Chỉ demo |
-| ClickHouse Cloud | OLAP realtime rất nhanh; MergeTree/materialized views mạnh | Cloud là trial/pay-as-you-go, không có cam kết perpetual free; mô hình/ops khác BigQuery | Không chọn ở giai đoạn 0đ |
-| Neon/PostgreSQL | Đã quen; relational/SCD dễ viết | Free storage hiện nhỏ; row store không phải analytical warehouse; analytics tranh compute/egress với OLTP | Không dùng làm DW |
-| DuckDB trên K3s | Đơn giản, SQL tốt | File locking, single-host disk và backup; đã từng gây xung đột lock; trái mục tiêu serverless | Chỉ local test |
-| MotherDuck | DuckDB managed, DX tốt | Free limits và product dependency; governance/integration thấp hơn BigQuery cho mục tiêu hiện tại | Candidate cho prototype, không canonical target |
+| BigQuery | Managed columnar analytics, SQL, partitioning/clustering, IAM, batch loading | Billing and cost controls needed for the intended DML/streaming pipeline | Selected |
+| BigQuery Sandbox | Useful for SQL demonstrations without a billing account | Tables expire after 60 days; no DML, streaming, or Data Transfer Service | Demo only |
+| ClickHouse Cloud | Fast analytical queries and incremental aggregation | Different operating/model choices; no assumption of permanent free hosting | Not the initial target |
+| Neon/PostgreSQL | Familiar relational model and SQL | Analytical scans compete with OLTP compute, storage, and network budgets | Operational source only |
+| DuckDB on K3s | Simple local analytical SQL | Single-host storage, locks, backup, and disk pressure | Keep existing Personalize use; no new canonical DW here |
+| MotherDuck | Managed DuckDB experience | Requires separate evaluation of governance, integration, limits, and cost | Prototype candidate |
 
-## 4. Quyết định
+## 4. Decision
 
-### 4.1 Warehouse
+### 4.1 Warehouse and naming
 
-Dùng **BigQuery, location `asia-southeast1` (Singapore)** cho mọi dataset liên quan. Không trộn region vì cross-region load/transfer có thể phát sinh phí và tăng độ trễ.
-
-Project/dataset đề xuất:
+Use BigQuery in `asia-southeast1` (Singapore). Keep related intermediate storage
+in the same region to simplify residency and avoid unnecessary transfer costs.
+Follow [the setup guide](05-bigquery-setup.md) for development provisioning.
 
 ```text
 GCP project: bdc-hub-analytics-<env>
 
-bdc_raw_<env>         append-only event/CDC landing, expiration ngắn
-bdc_staging_<env>     typed, deduplicated, quarantined
-bdc_core_<env>        conformed dim/fact/bridge/snapshot
-bdc_mart_<env>        dashboard-optimized aggregates
-bdc_governance_<env>  metadata, watermarks, DQ results, deletion ledger
-bdc_pii_<env>         restricted identity map when strictly needed
+bdc_raw_<env>         append-only event/CDC landing, short retention
+bdc_staging_<env>     typed, deduplicated, quarantined records
+bdc_core_<env>        conformed dimensions, facts, bridges, snapshots
+bdc_mart_<env>        dashboard aggregates
+bdc_governance_<env>  metadata, watermarks, quality results, deletion ledger
+bdc_pii_<env>         restricted identity mapping, only when necessary
 ```
 
-Không tạo dataset tên `dim`/`fact`: dim/fact là loại bảng trong `bdc_core`; dataset biểu diễn lifecycle/security boundary.
+Datasets represent lifecycle and access boundaries. Dimensions and facts are
+kinds of tables within `bdc_core`, not separate `dim` and `fact` datasets.
 
 ### 4.2 Ingestion
 
-Phase 1 dùng một **lightweight sink** chạy một replica trên K3s:
+Phase 1 uses one lightweight sink replica on K3s:
 
-- consume các Kafka topic đã có và outbox topic mới;
-- buffer trong RAM có giới hạn, flush theo 1–5 phút hoặc batch size;
-- ghi BigQuery qua Storage Write API committed/default stream hoặc batch load phù hợp;
-- commit Kafka offset chỉ sau khi BigQuery xác nhận;
-- dùng `event_id` để deduplicate vì crash giữa write và offset commit tạo duplicate.
+- Consume implemented domain topics with a dedicated warehouse consumer group.
+- Validate and redact records before landing them; preserve source identity.
+- Buffer in bounded memory and flush by size or after 1–5 minutes.
+- Choose batch load or the Storage Write API according to freshness, measured
+  volume, load-job quotas, and recovery requirements.
+- Commit only acknowledged, contiguous offsets in each Kafka partition.
+- Expect duplicates after a crash between BigQuery acknowledgement and offset commit.
 
-Không chạy full Kafka Connect + bốn Debezium connector trên node ngay từ đầu. CDC được bật có chọn lọc ở Phase 2 sau benchmark và có watchdog cho replication slot/WAL.
+Do not install a full Connect cluster and multiple Debezium connectors by default.
+Selective CDC starts in Phase 3 after capacity measurement and WAL/slot safeguards.
 
-BigQuery hiện công bố first 2 TiB/tháng Storage Write API gRPC miễn phí; batch load qua shared slot pool cũng miễn phí. Pipeline vẫn phải đọc pricing bằng IaC/runbook trước go-live vì chính sách có thể đổi.
+Shared-pool batch loading has no ingestion charge by default, while storage,
+queries, intermediate storage, and transfers can still be billed. The Storage
+Write API has separate allowances and pricing. Verify both against
+[BigQuery pricing](https://cloud.google.com/bigquery/pricing) before rollout.
 
 ### 4.3 Transformation
 
-Dùng **Dataform Core SQLX** hoặc SQL chuẩn được chạy bởi GitHub Actions/Cloud Scheduler. Phase 1 ưu tiên SQL chuẩn + script mỏng để tránh lock-in framework. Transformations chạy theo DAG:
+Prefer versioned SQL and a thin runner in Phase 1; Dataform Core SQLX can be
+introduced when dependency management justifies it. The transformation DAG is:
 
 ```text
-raw → stg normalize/dedupe → conformed dimensions → facts → snapshots → marts
+raw -> staging normalization/deduplication -> dimensions -> facts -> snapshots -> marts
 ```
 
-Mỗi model khai báo unique key, partition filter, owner, description, freshness và data tests. Không dùng Redis làm surrogate-key counter.
+Each model declares a unique key, partition scope, owner, description, freshness,
+and quality checks. Use deterministic surrogate keys rather than Redis counters.
 
 ### 4.4 Orchestration
 
-- Near-real-time ingest do consumer loop quản lý.
-- Transform micro-batch theo watermark, mặc định 5 phút cho facts và 15 phút cho dimensions.
-- Daily marts chạy sau khi đóng partition ngày với allowed lateness 48 giờ.
-- GitHub Actions dùng cho deploy/schema validation, không dùng như daemon ingest.
+- The consumer loop manages ingestion continuously.
+- Initial transformation targets are every five minutes for facts and every
+  fifteen minutes for dimensions, subject to dependency/late-binding handling.
+- Daily marts remain provisional during the 48-hour allowed-lateness window.
+- Use a scheduled runner for bounded transformation jobs. Cloud Scheduler is a
+  trigger and needs a runnable target; it does not execute SQL on its own.
+- Use GitHub Actions for schema validation and deployment, not a daemon sink.
 
 ### 4.5 Observability
 
-OpenTelemetry/Prometheus metrics tối thiểu:
+Track records read/written/rejected/deduplicated, input/output bytes, batch latency,
+consumer lag by partition, event-time freshness, BigQuery processed bytes and
+slot/load errors, CDC retained WAL, quality results, and quarantine counts.
+Separate ingestion health from transformation and dashboard freshness.
 
-- records read/written/rejected/duplicated;
-- bytes read/written và batch latency;
-- Kafka lag per topic/partition;
-- source event-time lag và warehouse freshness;
-- BigQuery bytes processed, storage bytes, slot/load errors;
-- CDC slot retained WAL bytes;
-- DQ pass rate và quarantine count.
+## 5. Cost controls
 
-## 5. Cost guardrails
+Budget alerts are not hard spending caps. Combine:
 
-Không thể dùng budget alert như hard cap. Áp dụng đồng thời:
+1. Budget alerts at 25/50/75/90/100%, with notification delivery tested.
+2. Project/user query quotas and `maximum_bytes_billed` on query jobs.
+3. `require_partition_filter = true` on large partitioned tables.
+4. Raw expiration of 30–90 days and staging expiration of 7–30 days, subject to policy.
+5. Dashboard access to curated marts rather than unrestricted raw scans.
+6. Separate ingestion, transformation, deployment, and analyst identities.
+7. Daily cost/volume forecasts and a stop control for analytics workloads.
+8. Privacy filtering to avoid storing unnecessary large or sensitive payloads.
 
-1. GCP budget alerts ở 25/50/75/90/100% và Pub/Sub notification.
-2. Custom query quota theo project/user; `maximum_bytes_billed` cho mọi ad-hoc/scheduled query.
-3. `require_partition_filter = true` cho fact lớn.
-4. Raw expiration 30–90 ngày; staging 7–30 ngày; core theo policy.
-5. Dashboard chỉ đọc marts, không quét raw.
-6. Service account sink không có quyền query; transform account không có quyền quản lý IAM.
-7. Cost anomaly job hằng ngày; kill switch dừng sink/transform nhưng không dừng ứng dụng nguồn.
-8. Không lưu prompt, completion, chat content hoặc source file vào BigQuery mặc định.
+Batch loading needs `bigquery.jobs.create`, which can also permit query job
+submission. Do not claim a batch loader cannot submit queries merely because
+identities are separate. Restrict readable datasets, use quotas, and audit jobs;
+a Storage Write API-only identity can omit job creation when it is not needed.
 
-## 6. Security và privacy
+Stopping a sink consumes the remaining Kafka retention window. Alert on that
+recovery deadline and preserve a source replay path; stopping analytics must not
+stop the application. Notification delays and already-running work mean these
+controls cannot promise an exact zero-cost ceiling.
 
-### Data classification
+## 6. Security and privacy
 
-| Class | Ví dụ | Warehouse policy |
+| Class | Examples | Warehouse policy |
 |---|---|---|
-| Public | course title đã publish, feature catalog | Core/mart được phép |
-| Internal | event type, latency, score, rank | Core, IAM nội bộ |
-| Confidential/PII | email, display name, organization membership | Tách `bdc_pii`, column policy/masking |
-| Restricted | password hash, bearer/API key, raw IP, chat body, prompt/response, learner code | Không ingest mặc định |
+| Public | Published course title, public feature catalog | Allowed in core/marts |
+| Internal | Event type, latency, score, rank | Internal IAM access |
+| Confidential/PII | Email, display name, organization membership | Restricted dataset/columns; only for an explicit purpose |
+| Restricted | Password hashes, bearer/API keys, raw IP, chat bodies, prompts/responses, learner code | Excluded by default |
 
-IP được HMAC với secret xoay vòng và chỉ giữ coarse geo nếu có consent. User agent được parse thành device/browser/os rồi raw value hết hạn sớm. Chat analytics chỉ giữ metadata (`char_count`, attachment/code flags), không giữ nội dung. MCP chỉ giữ tool, actor, scope, target, result class, latency; tuyệt đối không giữ API key hay arguments chứa nội dung nhạy cảm.
+Where explicitly approved, use rotating HMAC pseudonyms rather than raw IP, and
+retain coarse location only for the agreed purpose. Parse user agents into
+browser/device/OS categories; minimize retention of raw strings. Chat analytics
+keeps counts and flags. MCP keeps tool, actor, scope, target, result class, and
+latency, without sensitive arguments or tokens.
 
-Để hỗ trợ xóa dữ liệu, facts dùng `user_id` pseudonymous ổn định, PII mapping tách riêng. Deletion ledger theo dõi request; pipeline xóa/tombstone identity và dữ liệu thuộc phạm vi policy trong raw/core/mart.
+Service-local numeric user IDs remain identifying data; moving them into a
+warehouse does not anonymize them. Use a stable analytics pseudonym where the
+contract requires one and isolate any identity mapping. A deletion ledger must
+cover removal from raw, core, marts, replay inputs, and later backfills under the
+agreed policy. Normal append-only processing does not override privacy erasure.
 
 ## 7. Consequences
 
-### Positive
+Benefits include a small ingestion footprint on K3s, independently scalable
+analytics, reproducible SQL history, and per-user/feature/model cost attribution
+without collecting content bodies.
 
-- K3s chỉ chịu một consumer nhỏ và Kafka retention ngắn.
-- Warehouse scale độc lập và query không đè OLTP.
-- SCD và replay thực hiện bằng SQL/version-controlled contracts.
-- Có đường audit per-user/per-feature/per-model mà không lưu nội dung nhạy cảm.
+Trade-offs include a billing-enabled project, eventual consistency, mandatory
+deduplication, application-enforced BigQuery key integrity, and additional CDC
+network/compute/WAL costs. BigQuery does not enforce declared primary/foreign keys.
 
-### Trade-offs
+## 8. Modelling pitfalls to avoid
 
-- Billing account cần bật để có DML/streaming production.
-- Eventual consistency 1–15 phút.
-- At-least-once buộc mọi bảng có idempotency key.
-- BigQuery không enforce PK/FK; data tests và pipeline phải bảo vệ integrity.
-- CDC Neon giữ connection mở, ngăn scale-to-zero và tạo egress/WAL risk.
+- `GENERATE_UUID()` returns a string, not an `INT64` surrogate key.
+- `FARM_FINGERPRINT` is a 64-bit hash with collision risk. Use canonicalized
+  SHA-256 string keys for this design and retain natural keys for reconciliation.
+- Choose partitions from throughput and parallelism measurements, not a universal count.
+- Keep one canonical role-history representation; use membership bridges only
+  for actual many-to-many relationships.
+- Historical model costs require effective-dated pricing or a call-time snapshot.
+- Compare retained bytes with storage allowances; monthly incoming bytes alone
+  do not describe a year's retained storage.
 
-## 8. Rejected assumptions trong plan ban đầu
+## 9. References
 
-1. `GENERATE_UUID()` không thể nhét vào `INT64`; surrogate key dùng deterministic `STRING` hash hoặc UUID string.
-2. `FARM_FINGERPRINT` là 64-bit và có collision risk; key canonical dùng SHA-256 trên natural key + effective time, giữ natural key để đối soát.
-3. Không mặc định 3 partitions cho mọi topic. Topic low-volume dùng 1 partition; scale theo measured throughput/lag.
-4. SCD2 và SCD4 không áp dụng đồng thời cho cùng một lịch sử role nếu không có mục đích riêng; chọn một canonical history.
-5. `dim_ai_model` không thể Type 1 nếu muốn tính lại historical cost đúng giá tại thời điểm call. Model config/pricing là SCD2 hoặc snapshot giá trực tiếp trên fact.
-6. Estimate “3.7 GB/tháng” phải dựa trên event volume × encoded row size × retention, không cộng monthly numbers rồi so trực tiếp với 10 GB persistent storage.
-
-## 9. Official references
-
-- [BigQuery pricing and free usage](https://cloud.google.com/bigquery/pricing)
-- [BigQuery Sandbox limitations](https://cloud.google.com/bigquery/docs/sandbox)
-- [Batch loading and pricing](https://cloud.google.com/bigquery/docs/batch-loading-data)
-- [BigQuery Storage Write API](https://cloud.google.com/bigquery/docs/write-api)
-- [Neon logical replication considerations](https://neon.com/docs/guides/logical-replication-neon)
+- [BigQuery pricing](https://cloud.google.com/bigquery/pricing)
+- [BigQuery Sandbox](https://docs.cloud.google.com/bigquery/docs/sandbox)
+- [Batch loading](https://docs.cloud.google.com/bigquery/docs/batch-loading-data)
+- [Storage Write API](https://docs.cloud.google.com/bigquery/docs/write-api)
+- [BigQuery IAM](https://docs.cloud.google.com/bigquery/docs/access-control)
+- [Neon logical replication](https://neon.com/docs/guides/logical-replication-neon)
 - [Neon network transfer](https://neon.com/docs/introduction/network-transfer)
-- [Debezium PostgreSQL connector and WAL risks](https://debezium.io/documentation/reference/stable/connectors/postgresql.html)
-- [ClickHouse Cloud pricing](https://clickhouse.com/pricing)
+- [Debezium PostgreSQL connector](https://debezium.io/documentation/reference/stable/connectors/postgresql.html)

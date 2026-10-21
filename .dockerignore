@@ -1,0 +1,9 @@
+.git
+.venv
+.state
+__pycache__
+**/__pycache__
+*.ndjson
+*.parquet
+.env*
+credentials

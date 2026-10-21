@@ -1,43 +1,52 @@
-# ETL/ELT, event và CDC pipeline
+# ELT, event, and CDC pipeline
 
-## 1. Mục tiêu thiết kế
+Owner: BDC Hub platform/data team, with each source service owning its contracts.
+Status: target design, with an implemented bounded LMS capture/batch-load slice
+and logical BigQuery views. Continuous ingestion and the broader CDC/SCD pipeline
+are not deployed. The [active setup](05-bigquery-setup.md) documents the owner's
+billing-disabled choice and its limits.
 
-Pipeline phải thu nhận mọi sự kiện có giá trị phân tích mà không làm request người dùng phụ thuộc BigQuery/Kafka, không mất business mutation, replay được, và không tạo áp lực disk dài hạn trên K3s.
+## 1. Design goals
 
-Đây là **ELT**: source chuẩn hóa contract tối thiểu; warehouse giữ raw; logic dimensional chạy trong BigQuery. Dùng ETL ở edge chỉ cho masking, schema validation, size limit và loại secret.
+Capture analytical events without making user requests wait for BigQuery, preserve
+committed business changes, support replay, and bound memory/disk usage on K3s.
+New business mutations requiring reliable publication use a transactional outbox.
+Existing best-effort events do not acquire lossless delivery simply by adding a sink.
 
-## 2. Luồng canonical
+Use ELT: normalize the source contract, retain approved raw events, and perform
+dimensional transformations in BigQuery. At the edge, apply privacy filtering,
+schema validation, and payload limits before warehouse persistence.
+
+## 2. Canonical flow
 
 ```mermaid
 flowchart LR
-  A[Auth/LMS/Lab/Chat/AI DB transaction] --> O[(Transactional outbox)]
+  A[Owning service DB transaction] --> O[(Transactional outbox)]
   O --> R[Outbox relay]
-  R --> K[(Kafka KRaft\nshort retention)]
+  R --> K[(Kafka: bounded retention)]
   E[Existing domain events] --> K
-  K --> S[DW sink\nvalidate + micro-batch]
+  K --> S[Warehouse sink: validate and micro-batch]
   S --> Q[(BigQuery raw)]
-  Q --> T[Staging\ntype + dedupe + quarantine]
+  Q --> T[Staging: type, deduplicate, quarantine]
   T --> D[Conformed dimensions]
-  D --> F[Facts / bridges / snapshots]
+  D --> F[Facts, bridges, snapshots]
   F --> M[Marts]
-  C[Selective Neon CDC] -. dimension/backfill/reconcile .-> K
+  C[Selective CDC: Phase 3] -.-> K
 ```
 
-### Delivery semantics
+Delivery is at least once from outbox to Kafka and from Kafka to raw. Stable event
+IDs, source versions, and deterministic transformations make core results repeatable.
+This does not provide a distributed exactly-once transaction across Kafka and BigQuery.
+Ordering holds within a partition, not across topics or partitions. Resolve source
+updates using authoritative source versions/LSNs; ingestion order is only a tie-breaker.
 
-- Source DB + outbox insert: atomic.
-- Outbox → Kafka: at-least-once.
-- Kafka → BigQuery raw: at-least-once.
-- Effective warehouse result: exactly-once by `event_id`, source primary key/version and deterministic `MERGE`.
-- Event order is guaranteed only inside a partition key; SCD resolves by `(source_updated_at, source_sequence, ingested_at)`.
+## 3. Event envelope and compatibility
 
-## 3. Standard event envelope
-
-Mọi event mới dùng contract versioned:
+New event families use a versioned contract, for example:
 
 ```json
 {
-  "event_id": "uuid-v7",
+  "event_id": "019f0000-0000-7000-8000-000000000001",
   "event_type": "lms.enrollment.created",
   "schema_version": 1,
   "occurred_at": "2026-08-31T10:15:32.123Z",
@@ -50,9 +59,9 @@ Mọi event mới dùng contract versioned:
     "organization_id": 7
   },
   "context": {
-    "request_id": "...",
-    "trace_id": "...",
-    "session_id": "...",
+    "request_id": "example-request",
+    "trace_id": "example-trace",
+    "session_id": "example-session",
     "course_id": 58,
     "lesson_id": 120
   },
@@ -62,31 +71,39 @@ Mọi event mới dùng contract versioned:
 }
 ```
 
-Rules:
+- Keep UTC event/production times; apply reporting timezones explicitly downstream.
+- Reuse the same `event_id` on retry. Scope identity by producer/event family if
+  source IDs are not globally unique.
+- Accept additive optional fields. Breaking changes use a new versioned topic
+  with an explicit migration; support the agreed old/new versions during rollout.
+- `actor` identifies the initiator; `subject` identifies the affected entity.
+- Exclude passwords, authorization headers, keys, raw content, and file bodies.
+- Proposed payload limit: 64 KiB. Object references must also satisfy access/privacy policy.
 
-- Timestamp UTC, millisecond precision; UI chuyển timezone.
-- `event_id` không tái tạo khi retry.
-- `schema_version` chỉ tăng khi breaking change; consumer hỗ trợ N và N-1.
-- `actor.user_id` là người kích hoạt; `subject` là entity bị tác động.
-- Payload không chứa token, password, Authorization header, raw prompt/response hoặc file body.
-- Giới hạn kích thước mặc định 64 KiB; file/object chỉ lưu URI + metadata đã kiểm soát.
+For existing `lms.analytics.interactions`, preserve `interaction_id` and derive a
+namespaced canonical event key in the sink adapter. Preserve `event_id` from
+`recommender.interactions.v1`. Do not require envelope changes in producers just
+to start Phase 1, and do not generate a fresh random ID on each consumption.
 
-## 4. Khi nào event, outbox, CDC hay snapshot
+## 4. Capture selection
 
-| Nhu cầu | Cơ chế | Lý do |
+| Need | Mechanism | Reason |
 |---|---|---|
-| Login attempt/success, UI feature use, recommendation impression | Domain event | Không nhất thiết tồn tại thành row trạng thái |
-| Enrollment/course/lab mutation mới | Transactional outbox | Atomic với business write, giàu business meaning |
-| Dimension hiện có chưa có event | CDC có chọn lọc | Capture insert/update/delete ít xâm lấn |
-| Initial history/backfill | Consistent snapshot | CDC không tạo lại lịch sử trước slot |
-| Reconciliation | Incremental snapshot bằng `updated_at` + PK | Phát hiện miss/drift |
-| High-volume click/heartbeat | Gộp client telemetry, rate/sample | Bảo vệ Kafka, privacy và chi phí |
+| Login attempt, feature interaction, recommendation impression | Durable domain telemetry where needed | May have no corresponding state row |
+| New enrollment/course/lab mutation | Transactional outbox | Atomic publication intent with the business write |
+| Existing dimension changes without domain events | Selective CDC, Phase 3 | Capture insert/update/delete with a narrow allowlist |
+| Initial history/backfill | Consistent source-owned snapshot | CDC cannot recreate history before its capture point |
+| Reconciliation | Source-owned export/API with `(updated_at, primary_key)` cursor | Detect missing rows and drift |
+| High-volume clicks/heartbeats | Client aggregation, rate limits, documented sampling | Bound transport and storage costs |
 
-Không dùng CDC cho “mọi bảng”. CDC row-level không biết business intent, có thể phát tán PII, tạo nhiều event kỹ thuật và giữ WAL nếu connector lỗi. Không dùng polling đơn thuần cho event không có row durable như login failure hoặc impression.
+A warehouse consumer must not query another service's database directly. An
+explicit CDC/export integration is provisioned and owned by that source service,
+with an agreed allowlist. Polling alone cannot recover events that have no durable
+source record; timestamp cursors alone cannot reliably detect hard deletes.
 
 ## 5. Transactional outbox
 
-Mỗi DB domain có `analytics_outbox`:
+The owning service adds a forward-only migration resembling:
 
 ```sql
 CREATE TABLE analytics_outbox (
@@ -108,68 +125,81 @@ CREATE INDEX analytics_outbox_unpublished
   WHERE published_at IS NULL;
 ```
 
-Business service insert outbox trong cùng transaction. Relay dùng `FOR UPDATE SKIP LOCKED`, publish idempotently, rồi set `published_at`. Job housekeeping xóa rows đã publish sau 3–7 ngày theo batch nhỏ. Relay failure không làm fail user request.
+Insert the outbox row in the business transaction. A failed insert rolls back the
+mutation; a later relay failure does not fail an already-committed user action.
+A simple relay can claim rows with `FOR UPDATE SKIP LOCKED`, publish with bounded
+timeouts, and mark acknowledged rows as published. Keep lock duration bounded;
+use a lease/claim design if publishing under a DB transaction becomes costly.
 
-## 6. CDC trên Neon
+A crash after Kafka acknowledgement but before marking a row can publish it
+again. Kafka producer idempotence does not remove this application-level duplicate;
+consumers deduplicate by stable event identity. If aggregate order matters, prevent
+parallel relay workers from publishing later versions first, or carry a source
+sequence and resolve ordering downstream. Purge published rows in small batches
+after a proposed 3–7 days only when the recovery policy permits it.
 
-### Decision
+## 6. Selective CDC on Neon
 
-CDC là Phase 2, chỉ dùng cho các dimension/state tables thiếu domain event và audit-critical changes. Kết nối bằng **direct endpoint**, không dùng hostname `-pooler`, vì logical replication là session dài và protocol replication không phù hợp transaction pooling.
+CDC belongs to **Phase 3**. Use it for selected dimensions/state and audit-critical
+changes after source-owner review. Logical replication uses the direct endpoint,
+not a transaction-pooled endpoint.
 
-Neon lưu ý:
+Before enabling it, recheck [Neon's current guidance](https://neon.com/docs/guides/logical-replication-neon).
+Enabling logical replication changes WAL configuration and restarts computes;
+the documented setting is not reversible. Active subscribers can prevent
+scale-to-zero. Network transfer, lagging/inactive slots, and WAL retention require
+monitoring. Inventory the databases sharing each project/compute and provision
+publications/slots per database as required. Use the supported Console/API flow,
+not an assumed `ALTER SYSTEM` procedure.
 
-- bật logical replication thay đổi `wal_level`, restart computes và không thể revert theo tài liệu hiện tại;
-- subscriber active ngăn compute scale-to-zero;
-- logical replication tính vào public network transfer;
-- inactive/lagging slot có lifecycle và WAL retention risk;
-- mỗi database/connector cần publication và replication slot riêng.
+### Proposed allowlist
 
-Vì production hiện dùng chung Neon project/endpoint cho nhiều logical database, cần inventory chính xác database nào nằm cùng project. Không chạy câu lệnh `ALTER SYSTEM`; Neon bật logical replication từ Console/API quản trị.
-
-### CDC allowlist ban đầu
-
-| Source | Tables | Purpose | Excluded columns |
+| Source owner | Tables/entities | Target | Exclusions |
 |---|---|---|---|
-| Auth | users, roles/memberships, organizations | `dim_user`, role/org history | password hash, reset/MFA secrets |
-| LMS | courses, sections, section_content, enrollments | content/course dimensions, enrollment lifecycle | raw file body |
-| Lab | labs, lab_versions, environment_templates | lab/version dimensions | hidden testcase expected output if restricted |
-| AI | llm_models, task bindings | model/task config history | provider API keys |
-| AI | llm_usage_log after context migration | LLM call fact | error message sanitized/truncated |
+| Auth | Users, roles/memberships, organizations | User/org dimensions and membership history | Password hashes, reset/MFA secrets |
+| LMS | Courses, sections, section content, enrollments | Content/course dimensions and enrollment lifecycle | Raw documents/files |
+| Lab | Labs, versions, environment templates | Lab/version dimensions | Restricted hidden-test outputs |
+| AI | Model config and task bindings | Model/task dimensions | Provider keys |
+| AI | Usage logs after actor/context migration | LLM attempt fact | Raw provider errors and content |
 
-Chat messages, agent messages and uploaded document text are not in default CDC allowlist.
+Resolve exact table names against migrations before implementation. Chat messages,
+agent messages, and document text are excluded from the default allowlist.
 
-### CDC safeguards
+Use least-privilege credentials and explicit table/column filters. Track
+`restart_lsn`, `confirmed_flush_lsn`, retained WAL, heartbeat age, and slot state.
+Store connector offsets/schema history durably. Define source-owner thresholds
+and a resnapshot procedure before rollout. Merely stopping a lagging connector
+can increase retained WAL; do not pause business writes or drop slots automatically.
 
-- Dedicated least-privilege replication user.
-- `table.include.list` and column exclusion explicit.
-- Alert `restart_lsn`, `confirmed_flush_lsn`, retained WAL bytes and last event age.
-- Pause writes/escalate if retained WAL crosses threshold.
-- Heartbeat table/topic.
-- Document recovery after Neon branch restore/removal of slot.
-- Snapshot mode and schema history stored durably outside pod ephemeral disk.
+## 7. Kafka topics
 
-## 7. Kafka topic strategy
+Reuse adequate existing contracts. These are proposed topics, not deployed assets:
 
-Reuse domain topics where contract đủ tốt; không mirror mỗi database table thành một topic nếu không cần.
-
-| Topic | Key | Partitions initial | Retention | Mode |
-|---|---|---:|---:|---|
+| Topic | Key | Initial partitions | Retention | Cleanup |
+|---|---|---:|---|---|
 | `analytics.identity.v1` | user_id | 1 | 72h | delete |
-| `analytics.learning.v1` | user_id | 3 | 72h | delete |
+| `analytics.learning.v1` | user_id | 3, subject to measurement | 72h | delete |
 | `analytics.lab.v1` | user_id | 1 | 72h | delete |
 | `analytics.chat.v1` | user_id | 1 | 24h | delete |
 | `analytics.ai-usage.v1` | user_id/job_id | 1 | 72h | delete |
 | `analytics.mcp.v1` | user_id | 1 | 72h | delete |
-| `cdc.<domain>.<table>.v1` | PK | 1 each | 24–72h | compact + delete |
-| `analytics.dlq.v1` | source event_id | 1 | 7d | delete |
+| `cdc.<domain>.<table>.v1` | primary key | 1 each | 24–72h | compact + delete only if recoverable |
+| `analytics.dlq.v1` | source event identity | 1 | 7d, bounded bytes | delete |
 
-Không tạo mặc định “8 topics × 3 partitions”. Partition count tăng khi một partition không đáp ứng measured throughput hoặc cần consumer parallelism. Replication factor hiện là 1 nên Kafka không HA; sink không được xem Kafka là bản lưu duy nhất dài hạn.
+Compaction can remove intermediate row versions before a historical consumer sees
+them. A compacted CDC topic is not a reliable SCD history archive; use delete-only
+capture retention or another durable changelog when every change is required.
+Retention settings also need disk headroom for segments and internal topics.
 
-Producer settings: `acks=all`, idempotence khi client hỗ trợ, LZ4 hoặc Zstd, bounded retry, no sensitive logging. Topic schemas lưu JSON Schema trong Git; schema registry có thể bổ sung khi volume/team tăng.
+Increase partitions for measured throughput or consumer parallelism. Preserve the
+ordering contract when changing partition counts. The current single broker is
+not highly available. Use `acks=all`, producer idempotence where supported,
+LZ4/Zstd, bounded retries, and sanitized logs. These settings do not protect against
+loss of the only broker/PVC. Store event schemas in Git; add a registry when useful.
 
-## 8. Raw ingestion và idempotency
+## 8. Raw ingestion and idempotency
 
-Raw table chung theo event family, partition bằng `DATE(ingested_at)`, cluster `event_type, source`:
+An illustrative raw table follows. The names are planned, not deployed:
 
 ```sql
 CREATE TABLE bdc_raw_prod.events (
@@ -193,28 +223,55 @@ CLUSTER BY event_type, source
 OPTIONS (require_partition_filter = TRUE);
 ```
 
-Sink ghi cả Kafka coordinates. Staging chọn một row bằng:
+Keep actor/context in the approved canonical payload or declared envelope columns;
+do not lose attribution while adapting existing topics. Store a hash of the
+sanitized canonical payload. Deduplicate identical deliveries by `(source,
+event_id)` using deterministic tie-breakers. The same identity with a different
+payload is a contract conflict to quarantine, not an update to silently prefer.
+For CDC, include the source change version/LSN in the change identity.
 
-```sql
-QUALIFY ROW_NUMBER() OVER (
-  PARTITION BY event_id
-  ORDER BY ingested_at DESC, kafka_offset DESC
-) = 1
-```
+Disable automatic offset commits. Track the contiguous durable acknowledgement
+frontier per partition, including durable quarantine outcomes. Commit the next
+Kafka offset only after all earlier records have landed. Out-of-order batch
+completion and consumer rebalances must not skip unacknowledged records.
 
-Quarantine không chặn batch hợp lệ. Unknown schema version đi DLQ/quarantine và không commit “success” vào conformed layer.
+For load jobs, keep deterministic job IDs tied to immutable batch manifests;
+recover an ambiguous acknowledgement by inspecting that job before resubmission.
+For Storage Write API, distinguish default-stream at-least-once behavior from
+application-created streams with offsets. Neither replaces business-key deduplication.
 
-## 9. Watermark và late data
+Unknown schemas and malformed records go to durable, sanitized quarantine/DLQ.
+Commit their offsets only after that handoff succeeds; record the rejection and
+provide a replay path. Valid records can continue without silently counting
+quarantine as successful conformance.
 
-Mỗi source có watermark trong `bdc_governance.pipeline_watermarks` gồm source, partition, last offset/LSN, max occurred_at, run_id và checksum. Transform facts đọc partition mới + lookback 48 giờ. SCD correction hỗ trợ event đến trễ bằng recompute timeline của đúng natural key; không chỉ update current row.
+## 9. Watermarks and late data
 
-Daily marts ở trạng thái provisional trong D+2, sau đó final; backfill vẫn được phép và ghi `recomputed_at`.
+Track ingestion and transformation progress separately in governance tables:
+source/topic/partition, acknowledged offset or LSN, processed ingestion boundary,
+maximum observed event time, run ID, and reconciliation counts/checksum.
 
-## 10. AI usage pipeline
+Read all newly landed raw ingestion partitions, including events with old
+`occurred_at`. Derive the affected event dates and natural keys from those rows.
+Use a 48-hour lookback for routine corrections, but route older arrivals to an
+explicit correction/backfill queue; never drop them solely because their event
+time falls outside the lookback. Scope target mutations to the actual affected
+partitions/keys and advance transform watermarks only after successful writes.
 
-### Gap phải sửa ở source
+Daily marts are provisional through D+2. Later corrections remain possible and
+record `recomputed_at` and lineage. SCD corrections rebuild the affected natural
+key's historical timeline and rebind impacted facts, rather than editing only
+the current dimension row.
 
-`llm_usage_log` đã có task/model/token/latency/success/fallback/attempt/request nhưng thiếu actor/context. Migration source cần thêm:
+## 10. AI usage
+
+The current [usage writer](../../ai-service/app/core/llm_gateway/usage.py) records
+task/model, tokens, latency, success, fallback, attempt, and request ID, but lacks
+actor/course/job context and catches logging failures. It is not yet a complete,
+durable billing ledger. Before onboarding it, agree on publication durability
+and reconcile missing usage with provider/source records where available.
+
+A proposed owning-service migration adds context, after validating existing types:
 
 ```sql
 ALTER TABLE llm_usage_log
@@ -227,64 +284,76 @@ ALTER TABLE llm_usage_log
   ADD COLUMN parent_request_id VARCHAR(120);
 ```
 
-Context nên đặt bằng request-scoped `ContextVar`/explicit job context ở gateway, không sửa thủ công rời rạc từng adapter. Worker command phải mang `triggered_by`, user/course/job/trace. Một logical user action có thể tạo nhiều LLM attempts; fact grain là attempt, còn action/session/job fact aggregate bằng correlation IDs.
+Use request-scoped context or explicit job context at the gateway. Worker
+commands carry the initiator and user/course/job/trace context. Do not infer
+historical users by joining timestamps. One logical user action can produce
+several provider attempts; count each attempt for cost and use correlation IDs
+for action/session/job counts.
 
-Cost được snapshot trên fact tại call time:
+Snapshot effective prices/currency and provider-reported usage. For providers
+whose input total includes cached tokens, a possible formula is:
 
 ```text
-cost = prompt_tokens × input_price_per_token
-     + completion_tokens × output_price_per_token
-     + cached/image/audio/tool provider charges nếu có
+cost = uncached_input_tokens * uncached_input_unit_price
+     + cached_input_tokens   * cached_input_unit_price
+     + output_tokens         * output_unit_price
+     + other_non_overlapping_provider_charges
 ```
 
-Không backfill cost bằng “giá hiện tại” rồi coi là historical actual. Local model ghi currency/cost = 0 nhưng vẫn ghi tokens hoặc compute duration/GPU seconds.
+Normalize provider-specific definitions and per-million/per-token units first;
+never charge cached tokens twice. Missing usage/prices remain unknown or explicitly
+estimated. Do not substitute current prices and label them historical actuals.
+For local inference, distinguish zero external API spend from compute cost, and
+record compute time/GPU seconds where available.
 
-Indexing phải tách:
+Indexing separates extraction/VLM calls, embedding chunks/tokens/dimensions,
+reranking, vector writes/bytes, and total job duration/status/retries/cancellation.
 
-- extraction/VLM LLM calls;
-- embedding input tokens/chunks/dimensions/model;
-- reranking calls;
-- vector write count/bytes;
-- total job duration/status/retry/cancel.
+## 11. MCP telemetry
 
-## 11. MCP telemetry pipeline
+The existing MCP audit surface is in
+[`tool_adapter.py`](../../ai-service/mcp/tool_adapter.py). Proposed telemetry adds
+request/trace/session IDs, tool/version and read/write class, target entity/course,
+latency, controlled result/error class, sanitized byte/item counts, and client name.
+A client name is a claim, never authentication evidence. Keep a key surrogate or
+approved prefix only; never log bearer tokens.
 
-`mcp_audit_log` hiện có `key_id`, `user_id`, `action`, `success`, JSON metadata và time. Bổ sung contract:
+Link downstream LLM attempts through correlation IDs. Persist durable audit events
+and publish via an owning-service outbox where required. Domain facts count business
+mutations; MCP facts attribute the automation channel. The warehouse has no permission
+to call tools back into application services.
 
-- `request_id`, `trace_id`, `session_id`;
-- `tool_name`, tool version, read/write risk class;
-- `course_id`, target entity type/id;
-- `latency_ms`, result status/error class;
-- `client_name` (Claude/Codex/OpenCode/other) do client khai báo, không tin dùng cho auth;
-- bytes in/out và item count đã sanitize;
-- API key id/prefix được phép, raw bearer token không bao giờ log;
-- nếu MCP tool gọi LLM, link `llm_usage_log.parent_request_id` để không double count.
+### Local knowledge privacy
 
-MCP audit event được ghi durable trước, publish qua outbox; write tool bắt buộc authorization ở LMS tại execution time. Warehouse không được cấp quyền gọi ngược tool.
+Files read locally by an MCP client are not BDC data sources. Do not ingest local
+paths, filenames, aliases, hashes, excerpts, prompts, or unsent drafts. If an
+approved client context contract exists, it may report controlled fields such as
+`knowledge_mode = LMS_ONLY | LOCAL_ONLY | HYBRID` and `local_context_used`.
+These remain client claims. Publishing a reviewed derived lesson generates a
+normal domain event and MCP attribution, without fingerprinting local source files.
 
-### Local-knowledge privacy
+## 12. Failure, rollout, and replay
 
-File local được MCP client đọc không phải nguồn dữ liệu của BDC và không được đưa vào warehouse. BDC chỉ quan sát được MCP calls thực sự đến server. Không log local path, filename, source alias, file hash, excerpt, prompt hoặc nội dung draft chưa gửi.
+| Condition | Required behavior |
+|---|---|
+| Sink unavailable | Application continues; monitor the remaining Kafka replay window |
+| BigQuery quota/auth failure | Bounded backoff with jitter, no offset advancement, alert on recovery deadline |
+| Poison event | Durable sanitized quarantine before advancing the partition frontier |
+| Duplicate delivery | Preserve raw evidence; deduplicate staging/core deterministically |
+| Lost Kafka window | Source-owned reconciliation/export; event-only history needs retained outbox/archive |
+| CDC lag | Source-owner WAL/slot runbook; preserve recoverability before slot removal/resnapshot |
+| Breaking schema | Deploy compatible consumers first, then new producers/topics, verify, retire old version |
 
-Nếu client tự nguyện khai báo context, telemetry chỉ được phép giữ controlled fields như `knowledge_mode = LMS_ONLY | LOCAL_ONLY | HYBRID` và `local_context_used = true`; đây là client claim, không phải bằng chứng BDC đã đọc file. Khi giáo viên duyệt một derived Markdown lesson, warehouse ghi business event tạo lesson và MCP attribution như bình thường, nhưng không suy diễn hay lưu fingerprint của source file local.
+Deploy raw/governance schema and compatible consumers before producers, then
+transformations and marts. Roll back by stopping the affected analytics rollout
+while retaining raw data and replay inputs. Avoid deleting evidence to hide a failed
+model. Recovery objectives must acknowledge single-broker and best-effort source gaps.
 
-## 12. Failure and replay runbook
+## 13. Quality gates
 
-1. Sink lỗi: application tiếp tục; Kafka giữ event trong retention.
-2. BigQuery quota/auth lỗi: exponential backoff, không commit offset, alert trước khi retention window hết.
-3. Poison event: ghi DLQ/quarantine với redacted error, commit offset để không kẹt partition.
-4. Duplicate: raw có thể duplicate; staging/core dedupe.
-5. Lost Kafka window: chạy source reconciliation snapshot theo `updated_at`/PK; event-only facts cần outbox chưa purge hoặc backup.
-6. CDC lag: monitor WAL; nếu unsafe, stop connector có kiểm soát, snapshot lại theo runbook, không drop slot mù quáng.
-7. Schema breaking: producer deploy compatibility trước, consumer hỗ trợ dual version, rồi cleanup.
-
-## 13. Data quality gates
-
-- uniqueness: event IDs, dimension current row, source fact IDs;
-- not-null: natural keys, grain columns, occurred time;
-- accepted values: event/status/actor/trigger types;
-- relationships: fact dimension key resolve rate;
-- freshness: per source SLA;
-- reconciliation: source daily counts/sums vs warehouse;
-- privacy scan: token/key/email/IP patterns in forbidden columns;
-- volume anomaly: row count and bytes deviation.
+Check identity uniqueness, required keys/timestamps, accepted event/status types,
+dimension resolution, source-specific freshness, source-to-target counts/sums,
+privacy patterns in forbidden fields, and volume/byte anomalies. Reconciliation
+must account explicitly for deduplication, filtering, quarantine, and late arrivals.
+Test replay, duplicate conflicts, partial batch failure, rebalance, late updates,
+quota/auth failures, and deletion requests before relying on a mart.

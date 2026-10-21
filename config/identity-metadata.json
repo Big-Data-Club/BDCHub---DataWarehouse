@@ -1,0 +1,5 @@
+{
+  "project_number": "1039876363296",
+  "provider": "projects/1039876363296/locations/global/workloadIdentityPools/bdc-k3s/providers/warehouse",
+  "token_audience": "https://iam.googleapis.com/projects/1039876363296/locations/global/workloadIdentityPools/bdc-k3s/providers/warehouse"
+}

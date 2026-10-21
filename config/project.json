@@ -1,0 +1,8 @@
+{
+  "project_id": "bdc-web-487000",
+  "location": "asia-southeast1",
+  "environment": "prod",
+  "mode": "sandbox",
+  "maximum_bytes_billed": 104857600,
+  "source_topic": "lms.analytics.interactions"
+}
