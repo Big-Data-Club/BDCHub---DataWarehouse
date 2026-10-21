@@ -11,22 +11,29 @@ sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'scripts'))
 from warehouse import ROOT,load_config,render_sql
 
 
-def main():
-    config=load_config(ROOT/'config/project.json')
-    client=bigquery.Client(project=config['project_id'],location=config['location'])
+def apply_models(client, config):
+    """Migrate models inside operator-provisioned datasets, without project DDL."""
     for layer in ('raw','staging','core','mart','governance'):
         try:
             ds=client.get_dataset(f"{config['project_id']}.bdc_{layer}_{config['environment']}",timeout=30)
         except NotFound:
-            continue
+            raise RuntimeError('runtime_dataset_missing_run_operator_bootstrap') from None
         if ds.location.lower()!=config['location'].lower():
             raise RuntimeError('existing_dataset_location_mismatch')
-    for path in (ROOT/'ddl/001_foundation.sql',ROOT/'transforms/001_lms_views.sql'):
-        job=client.query(render_sql(config,path),job_id='bdc_release_'+uuid.uuid4().hex,
+    for path in (ROOT/'ddl/002_runtime_models.sql',ROOT/'transforms/001_lms_views.sql'):
+        job_id='bdc_release_'+uuid.uuid4().hex
+        print(json.dumps({'migration':path.name,'job_id':job_id,'submitted':True}),flush=True)
+        job=client.query(render_sql(config,path),job_id=job_id,
                          job_config=bigquery.QueryJobConfig(maximum_bytes_billed=config['maximum_bytes_billed'],
                          labels={'application':'bdc','workload':'warehouse-migration'}))
         job.result(timeout=240)
         print(json.dumps({'migration':path.name,'job_id':job.job_id,'completed':True}),flush=True)
+
+
+def main():
+    config=load_config(ROOT/'config/project.json')
+    client=bigquery.Client(project=config['project_id'],location=config['location'])
+    apply_models(client, config)
 
 
 if __name__=='__main__':

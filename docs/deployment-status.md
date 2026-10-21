@@ -67,9 +67,17 @@ count/hash reconciliation, and immutable-batch retry path are implemented and
 exercised. The Google CLI is installed outside `/tmp`; its saved login refreshed
 without a new browser login during this rollout.
 
-Continuous ingestion and scheduling are **not running**. Subsequent work needs a
-runtime identity, durable checkpoint/replay storage, a scheduler/consumer process,
-source-owned historical reconciliation, and agreed privacy/retention handling.
+Continuous ingestion is **not running in the last verified rollout**. Keyless
+runtime/deployment identities are provisioned; the worker, durable checkpoint
+implementation, PVC manifest, and CI image build are implemented. The production
+release `8f6fc8b18b989ae30edebbc8af4a961d03773a23` stopped at migration job
+`bdc_release_378850ae39b14621a989779b79e51c7f`: bootstrap `CREATE SCHEMA` required
+project-level `bigquery.datasets.create`, which the dataset-scoped deployment
+identity intentionally lacks. Runtime migrations now target only tables/views
+inside the five pre-provisioned datasets and fail closed if a dataset is missing.
+A successful corrected rollout and real acknowledged worker batch are still
+required before claiming continuous ingestion. Source-owned historical
+reconciliation and agreed privacy/retention handling remain necessary.
 The retained Kafka window does not recover all past LMS history or publications
 that failed before reaching Kafka. Do not describe this one-time capture as a
 complete historical or continuously updated warehouse.

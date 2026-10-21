@@ -15,6 +15,11 @@ files alone do not prove that a release is deployed.
 5. The existing production runner applies only warehouse service accounts, identity
    routing ConfigMaps, and its checkpoint PVC. A separate migration Job completes
    schema/view changes before the worker Deployment is updated.
+   Dataset creation is an operator bootstrap action (`ddl/001_foundation.sql`).
+   Runtime releases require all five datasets to exist and execute only
+   `ddl/002_runtime_models.sql` and the view definitions. They do not require
+   project-level `bigquery.datasets.create`. Migration logs include a job ID before
+   execution so failures can be inspected without exposing provider payloads.
 6. Rollout checks pod readiness and exact source revision. Failure restores the
    previous warehouse pod specification when one exists. Schema changes must remain
    compatible; restoring a prior model release requires its migration image too.
