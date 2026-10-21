@@ -78,6 +78,12 @@ inside the five pre-provisioned datasets and fail closed if a dataset is missing
 A successful corrected rollout and real acknowledged worker batch are still
 required before claiming continuous ingestion. Source-owned historical
 reconciliation and agreed privacy/retention handling remain necessary.
+Release `05d357b4a7ee047fea34647c41a00f412cf905ef` completed both model
+migrations. Its worker failed during partition discovery: topic listing returned
+the source topic but the unsubscribed consumer's partition cache was empty.
+The correction requests topic-specific metadata from Kafka's Admin API before
+explicit assignment. A diagnostic with the runtime identity confirmed raw-table
+access and the source topic's presence without reading events or committing offsets.
 The retained Kafka window does not recover all past LMS history or publications
 that failed before reaching Kafka. Do not describe this one-time capture as a
 complete historical or continuously updated warehouse.

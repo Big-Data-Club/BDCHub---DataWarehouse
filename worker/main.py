@@ -13,6 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from aiokafka import AIOKafkaConsumer, TopicPartition
+from aiokafka.admin import AIOKafkaAdminClient
 from aiokafka.structs import OffsetAndMetadata
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'scripts'))
@@ -27,6 +28,26 @@ STATE = {'ready':False,'last_loop':0.0,'last_ack':None,'acknowledged_rows':0,
 
 def emit(event, **fields):
     print(json.dumps({'event':event,**fields}),flush=True)
+
+
+async def source_partitions(bootstrap_servers):
+    # topics() returns a separate metadata snapshot; it does not populate an
+    # unsubscribed consumer's partition cache. Explicit assignment needs a
+    # topic-specific broker response before constructing TopicPartitions.
+    admin=AIOKafkaAdminClient(bootstrap_servers=bootstrap_servers,
+                              client_id='bdc-warehouse-metadata',request_timeout_ms=30000)
+    try:
+        await admin.start()
+        metadata=await admin.describe_topics([TOPIC])
+        topic=next((item for item in metadata if item['topic']==TOPIC),None)
+        if topic is None or topic.get('error_code',0):
+            raise RuntimeError('source_topic_not_available')
+        partitions=topic.get('partitions',[])
+        if not partitions or any(item.get('error_code',0) for item in partitions):
+            raise RuntimeError('source_partition_metadata_unavailable')
+        return sorted(item['partition'] for item in partitions)
+    finally:
+        await admin.close()
 
 
 class Health(BaseHTTPRequestHandler):
@@ -80,10 +101,7 @@ async def run():
     try:
         # Explicit single-replica assignment avoids a rebalance racing a pending
         # upload. The distinct group stores offsets, without joining app groups.
-        await consumer.topics()
-        partitions=consumer.partitions_for_topic(TOPIC)
-        if not partitions:
-            raise RuntimeError('source_topic_not_available')
+        partitions=await source_partitions(os.environ['KAFKA_BROKERS'])
         assigned=[TopicPartition(TOPIC,p) for p in sorted(partitions)]
         consumer.assign(assigned)
         starts=await consumer.beginning_offsets(assigned)

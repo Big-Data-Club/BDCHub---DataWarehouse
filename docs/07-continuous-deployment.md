@@ -55,6 +55,8 @@ The worker uses only `lms.analytics.interactions` and group
 `bdc-warehouse-lms-v1`, separate from existing application groups. One Recreate
 replica and a PVC file lock enforce one writer. Explicit assignment is captured at
 startup; changes to topic partitions require a controlled restart.
+Partition discovery uses the broker's topic-specific Admin metadata response;
+listing topic names does not populate an unsubscribed consumer's partition cache.
 
 Each batch is bounded by 1,000 records/1 MiB and a five-minute flush interval.
 Actual source event IDs, event times, and Kafka coordinates are preserved. No
