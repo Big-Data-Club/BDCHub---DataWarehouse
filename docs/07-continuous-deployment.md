@@ -51,8 +51,11 @@ Do not copy K3s admin kubeconfig or private signing keys into the worker.
 
 ## Consumer and delivery contract
 
-The worker uses only `lms.analytics.interactions` and group
-`bdc-warehouse-lms-v1`, separate from existing application groups. One Recreate
+The original worker uses `lms.analytics.interactions` and group
+`bdc-warehouse-lms-v1`. The platform-envelope configuration uses
+`bdc-warehouse-platform-v1` for the implemented LMS and recommendation topics,
+separate from application groups. It reports optional missing topics; permission
+or metadata failures do not masquerade as absent sources. One Recreate
 replica and a PVC file lock enforce one writer. Explicit assignment is captured at
 startup; changes to topic partitions require a controlled restart.
 Partition discovery uses the broker's topic-specific Admin metadata response;
@@ -63,6 +66,12 @@ Actual source event IDs, event times, and Kafka coordinates are preserved. No
 sample records or fabricated historical dimensions are inserted. A new group can
 replay retained real events; raw deliveries can repeat while conformed facts remain
 unique by stable source identity and payload hash.
+
+Platform cutover uses a separate journal directory on the existing PVC and refuses
+startup if the legacy journal still has a pending batch. Journal identity binds
+the group, target and table incarnation. Legacy raw evidence remains available
+through reconciled learning staging/core views; its expiry is unchanged. Rollback
+preserves the new journal for explicit recovery rather than resetting its group.
 
 Payload bytes and the next offset frontier are stored atomically in a private
 SQLite journal with full synchronous durability. The worker then submits a stable
@@ -97,6 +106,36 @@ The internal HTTP endpoints are `/health/live`, `/health/ready`, and `/status` o
 port 8080. Status includes revision, partition count, source lag, pending records,
 acknowledged row/batch counts, last acknowledgement, and raw-table expiry. There is
 no public ingress and status contains no learner records or credentials.
+
+## Source-owned AI usage snapshots
+
+`data-warehouse-ai-snapshot` runs at minute 17 every six hours UTC with Kubernetes
+`concurrencyPolicy: Forbid`. It uses the narrow ingest identity and a separate
+private 256 MiB state PVC. The owning AI endpoint is
+`GET /ai/internal/warehouse/llm-attempts`; it requires the existing internal secret,
+accepts a 1–60 day window, and exports at most 10,000 metadata rows per snapshot.
+The manifest starts with a seven-day overlapping window. This is a bounded
+capture, not an all-time export or low-latency AI event feed.
+
+Count and cursor reads share one read-only repeatable-read transaction. Header
+and trailer establish expected count and canonical payload hash. Partial streams,
+oversized windows, invalid contracts and missing trailers cannot be acknowledged.
+The collector caps line/total bytes, row count and network/query duration. It
+never receives source database credentials or prints source records.
+
+Only confirmed identities/hashes enter a local seen cache. Overlapping exports
+skip confirmed unchanged rows instead of repeatedly loading the same seven days.
+Conflicting versions still land for governance inspection. Upload failure retains
+the journal; restart recovers the same BigQuery job. An acknowledged batch
+interrupted before cache update/finish is also recoverable. Cache/journal identity
+includes target incarnation, preventing reuse after table recreation. Late commits
+inside the overlap are rediscovered; older transactions require owner backfill.
+Serial IDs are not treated as commit watermarks.
+
+Deploy the AI endpoint before manually starting the first snapshot Job. A failed
+scheduled Job remains failure with pending state; it is not zero AI activity.
+Reduce the window or implement the planned outbox before exceeding these bounds.
+Measure source load, raw growth and replay capacity before raising limits.
 
 ## Verification
 

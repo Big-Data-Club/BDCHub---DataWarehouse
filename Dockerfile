@@ -8,8 +8,10 @@ RUN pip install --no-cache-dir --require-hashes -r requirements.txt
 COPY worker/ ./worker/
 COPY scripts/export_lms_kafka.py scripts/warehouse.py ./scripts/
 COPY config/project.json ./config/project.json
+COPY contracts/ ./contracts/
 COPY ddl/ ./ddl/
 COPY transforms/ ./transforms/
+COPY checks/ ./checks/
 USER 1001:1001
 EXPOSE 8080
 CMD ["python", "-m", "worker.main"]

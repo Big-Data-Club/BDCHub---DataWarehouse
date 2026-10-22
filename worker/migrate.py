@@ -9,6 +9,7 @@ from google.cloud import bigquery
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'scripts'))
 from warehouse import ROOT,load_config,render_sql
+from worker.quality import run_checks
 
 
 def apply_models(client, config):
@@ -20,7 +21,8 @@ def apply_models(client, config):
             raise RuntimeError('runtime_dataset_missing_run_operator_bootstrap') from None
         if ds.location.lower()!=config['location'].lower():
             raise RuntimeError('existing_dataset_location_mismatch')
-    for path in (ROOT/'ddl/002_runtime_models.sql',ROOT/'transforms/001_lms_views.sql'):
+    for path in (ROOT/'ddl/002_runtime_models.sql',ROOT/'ddl/003_platform_events.sql',
+                 ROOT/'transforms/001_lms_views.sql',ROOT/'transforms/002_platform_core.sql'):
         job_id='bdc_release_'+uuid.uuid4().hex
         print(json.dumps({'migration':path.name,'job_id':job_id,'submitted':True}),flush=True)
         job=client.query(render_sql(config,path),job_id=job_id,
@@ -28,6 +30,7 @@ def apply_models(client, config):
                          labels={'application':'bdc','workload':'warehouse-migration'}))
         job.result(timeout=240)
         print(json.dumps({'migration':path.name,'job_id':job.job_id,'completed':True}),flush=True)
+    run_checks(client,config,ROOT,render_sql)
 
 
 def main():

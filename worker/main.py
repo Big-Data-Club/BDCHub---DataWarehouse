@@ -8,6 +8,8 @@ import signal
 import sys
 import threading
 import time
+import uuid
+import sqlite3
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -20,6 +22,7 @@ sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'scripts'))
 from export_lms_kafka import TOPIC, normalize_source
 from worker.bigquery_sink import BigQuerySink
 from worker.state import Journal
+from worker.contracts import TOPICS, envelope
 
 STATE = {'ready':False,'last_loop':0.0,'last_ack':None,'acknowledged_rows':0,
          'successful_batches':0,'last_error_class':None,'pending_records':0,
@@ -30,7 +33,7 @@ def emit(event, **fields):
     print(json.dumps({'event':event,**fields}),flush=True)
 
 
-async def source_partitions(bootstrap_servers):
+async def source_partitions(bootstrap_servers,topic_name=TOPIC):
     # topics() returns a separate metadata snapshot; it does not populate an
     # unsubscribed consumer's partition cache. Explicit assignment needs a
     # topic-specific broker response before constructing TopicPartitions.
@@ -38,10 +41,12 @@ async def source_partitions(bootstrap_servers):
                               client_id='bdc-warehouse-metadata',request_timeout_ms=30000)
     try:
         await admin.start()
-        metadata=await admin.describe_topics([TOPIC])
-        topic=next((item for item in metadata if item['topic']==TOPIC),None)
-        if topic is None or topic.get('error_code',0):
+        metadata=await admin.describe_topics([topic_name])
+        topic=next((item for item in metadata if item['topic']==topic_name),None)
+        if topic is None or topic.get('error_code',0)==3:
             raise RuntimeError('source_topic_not_available')
+        if topic.get('error_code',0):
+            raise RuntimeError('source_topic_metadata_denied_or_unavailable')
         partitions=topic.get('partitions',[])
         if not partitions or any(item.get('error_code',0) for item in partitions):
             raise RuntimeError('source_partition_metadata_unavailable')
@@ -71,7 +76,7 @@ class Health(BaseHTTPRequestHandler):
         pass
 
 
-async def run():
+async def run(stop=None):
     logging.getLogger('aiokafka').setLevel(logging.CRITICAL)
     interval = int(os.environ.get('FLUSH_INTERVAL_SECONDS','300'))
     max_records = int(os.environ.get('BATCH_MAX_RECORDS','1000'))
@@ -82,27 +87,60 @@ async def run():
         raise RuntimeError('invalid_batch_limits')
     if max_spool > 67108864 or max_spool < max_bytes or not 1 <= daily_loads <= 1000:
         raise RuntimeError('invalid_spool_or_quota_limits')
+    stream=os.environ.get('WAREHOUSE_STREAM','lms')
+    if stream not in ('lms','platform'):
+        raise RuntimeError('invalid_stream_contract')
+    if stream=='platform':
+        # A cutover must not abandon a durable batch left by the legacy writer.
+        legacy=Path(os.environ.get('LEGACY_STATE_DIR','/var/lib/warehouse/state'))/'checkpoint.sqlite3'
+        if legacy.exists():
+            db=sqlite3.connect(legacy.resolve().as_uri()+'?mode=ro',uri=True)
+            try:
+                if db.execute('SELECT COUNT(*) FROM batches').fetchone()[0]:
+                    raise RuntimeError('legacy_journal_requires_recovery_before_cutover')
+            finally:
+                db.close()
     journal=Journal(os.environ.get('STATE_DIR','/var/lib/warehouse'))
     sink=BigQuerySink(os.environ.get('GOOGLE_CLOUD_PROJECT','bdc-web-487000'),
                       os.environ.get('BIGQUERY_LOCATION','asia-southeast1'),
                       os.environ.get('BIGQUERY_TABLE','bdc-web-487000.bdc_raw_prod.lms_micro_interactions'))
     await asyncio.to_thread(sink.inspect)
+    group='bdc-warehouse-platform-v1' if stream=='platform' else 'bdc-warehouse-lms-v1'
+    journal.bind_stream(group+':'+sink.table+':'+sink.table_created.isoformat(),allow_legacy=stream=='lms')
+    def coordinate(part):
+        return f'{part.topic}:{part.partition}' if stream=='platform' else str(part.partition)
+    def topic_partition(value):
+        if stream=='platform':
+            topic,partition=value.rsplit(':',1)
+            return TopicPartition(topic,int(partition))
+        return TopicPartition(TOPIC,int(value))
     consumer=AIOKafkaConsumer(
-        bootstrap_servers=os.environ['KAFKA_BROKERS'],group_id='bdc-warehouse-lms-v1',
+        bootstrap_servers=os.environ['KAFKA_BROKERS'],group_id=group,
         client_id='bdc-warehouse-worker', enable_auto_commit=False,auto_offset_reset='none',
         fetch_max_bytes=1048576,max_partition_fetch_bytes=1048576,
         request_timeout_ms=30000,max_poll_interval_ms=600000,
     )
-    stop=asyncio.Event()
     loop=asyncio.get_running_loop()
-    for sig in (signal.SIGTERM,signal.SIGINT):
-        loop.add_signal_handler(sig,stop.set)
+    if stop is None:
+        stop=asyncio.Event()
+        for sig in (signal.SIGTERM,signal.SIGINT):
+            loop.add_signal_handler(sig,stop.set)
     await consumer.start()
     try:
         # Explicit single-replica assignment avoids a rebalance racing a pending
         # upload. The distinct group stores offsets, without joining app groups.
-        partitions=await source_partitions(os.environ['KAFKA_BROKERS'])
-        assigned=[TopicPartition(TOPIC,p) for p in sorted(partitions)]
+        assigned=[]
+        STATE['sources']={}
+        for topic in TOPICS if stream=='platform' else [TOPIC]:
+            try:
+                partitions=await source_partitions(os.environ['KAFKA_BROKERS'],topic)
+            except RuntimeError as exc:
+                if stream=='platform' and topic!=TOPIC and str(exc)=='source_topic_not_available':
+                    STATE['sources'][topic]={'available':False,'reason':'source_topic_not_available'}
+                    continue
+                raise
+            assigned.extend(TopicPartition(topic,p) for p in sorted(partitions))
+            STATE['sources'][topic]={'available':True,'partitions':len(partitions)}
         consumer.assign(assigned)
         starts=await consumer.beginning_offsets(assigned)
         ends=await consumer.end_offsets(assigned)
@@ -110,14 +148,15 @@ async def run():
         positions={}
         for part in assigned:
             committed=await consumer.committed(part)
-            position=committed if committed is not None else bootstrap.get(str(part.partition),starts[part])
+            position=committed if committed is not None else bootstrap.get(coordinate(part),starts[part])
             if not starts[part] <= position <= ends[part]:
                 raise RuntimeError('checkpoint_outside_retained_kafka_window')
             positions[part]=position
             consumer.seek(part,position)
         STATE['assigned_partitions']=len(assigned)
         STATE['ready']=True
-        emit('worker_started',topic=TOPIC,partitions=len(assigned),flush_seconds=interval,version=STATE['version'])
+        emit('worker_started',topics=sorted({p.topic for p in assigned}),stream=stream,
+             partitions=len(assigned),flush_seconds=interval,version=STATE['version'])
         last_upload=0.0
         last_lag=0.0
 
@@ -146,7 +185,7 @@ async def run():
                 STATE['acknowledged_rows']+=rows
                 STATE['successful_batches']+=1
                 emit('batch_acknowledged',rows=rows,job_id=batch['job_id'])
-            commit={TopicPartition(TOPIC,int(p)):OffsetAndMetadata(int(offset),'')
+            commit={topic_partition(p):OffsetAndMetadata(int(offset),'')
                     for p,offset in json.loads(batch['next_offsets']).items()}
             await consumer.commit(commit)
             for part,offset in commit.items():
@@ -170,6 +209,7 @@ async def run():
                 lines=[]
                 size=0
                 next_offsets={}
+                capture_id=uuid.uuid4().hex
                 first_read=time.monotonic()
                 while not stop.is_set():
                     STATE['last_loop']=time.monotonic()
@@ -177,12 +217,16 @@ async def run():
                     full=False
                     for part,messages in fetched.items():
                         for message in messages:
-                            source=normalize_source(json.loads(message.value))
-                            canonical=json.dumps(source,sort_keys=True,separators=(',',':'),allow_nan=False)
-                            row=dict(source,event_id=f'{TOPIC}:{source["interaction_id"]}',
-                                     ingested_at=datetime.now(timezone.utc).isoformat(timespec='microseconds'),
-                                     kafka_topic=message.topic,kafka_partition=message.partition,kafka_offset=message.offset,
-                                     payload_sha256=hashlib.sha256(canonical.encode()).hexdigest())
+                            if stream=='platform':
+                                row=envelope(TOPICS[message.topic],json.loads(message.value),topic=message.topic,
+                                             partition=message.partition,offset=message.offset,capture_id=capture_id)
+                            else:
+                                source=normalize_source(json.loads(message.value))
+                                canonical=json.dumps(source,sort_keys=True,separators=(',',':'),allow_nan=False)
+                                row=dict(source,event_id=f'{TOPIC}:{source["interaction_id"]}',
+                                         ingested_at=datetime.now(timezone.utc).isoformat(timespec='microseconds'),
+                                         kafka_topic=message.topic,kafka_partition=message.partition,kafka_offset=message.offset,
+                                         payload_sha256=hashlib.sha256(canonical.encode()).hexdigest())
                             line=json.dumps(row,separators=(',',':'),allow_nan=False).encode()+b'\n'
                             if len(line)>max_bytes:
                                 raise RuntimeError('source_record_exceeds_batch_bound')
@@ -191,7 +235,7 @@ async def run():
                                 break
                             lines.append(line)
                             size+=len(line)
-                            next_offsets[str(part.partition)]=message.offset+1
+                            next_offsets[coordinate(part)]=message.offset+1
                         if full:
                             break
                     STATE['pending_records']=len(lines)
@@ -199,6 +243,8 @@ async def run():
                     if now-last_lag>=30:
                         latest=await consumer.end_offsets(assigned)
                         STATE['source_lag']=sum(max(0,latest[p]-positions[p]) for p in assigned)
+                        for topic in {p.topic for p in assigned}:
+                            STATE['sources'][topic]['lag']=sum(max(0,latest[p]-positions[p]) for p in assigned if p.topic==topic)
                         STATE['raw_table_expires_at']=sink.table_expires.isoformat()
                         last_lag=now
                     if sink.table_expires <= datetime.now(timezone.utc):
@@ -230,6 +276,7 @@ async def run():
         emit('worker_stopped',pending_batch=bool(journal.pending()))
     finally:
         await consumer.stop()
+        journal.close()
 
 
 def main():

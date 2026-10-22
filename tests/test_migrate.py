@@ -13,6 +13,7 @@ def migration_client():
     client = Mock()
     client.get_dataset.return_value = SimpleNamespace(location='asia-southeast1')
     client.query.return_value.job_id = 'migration-job'
+    client.query.return_value.result.return_value = [{'unit_error_count':0}]
     return client
 
 
@@ -21,11 +22,11 @@ def test_release_only_modifies_models_in_existing_datasets(capsys):
     apply_models(client, load_config(ROOT / 'config/project.json'))
     assert client.get_dataset.call_count == 5
     queries = [call.args[0] for call in client.query.call_args_list]
-    assert len(queries) == 2
+    assert len(queries) == 5
     assert all('CREATE SCHEMA' not in sql.upper() for sql in queries)
     assert 'CREATE TABLE IF NOT EXISTS' in queries[0]
-    assert 'CREATE OR REPLACE VIEW' in queries[1]
-    assert client.query.return_value.result.call_count == 2
+    assert 'CREATE OR REPLACE VIEW' in queries[-2]
+    assert client.query.return_value.result.call_count == 5
     assert '"completed": true' in capsys.readouterr().out
 
 
@@ -55,3 +56,11 @@ def test_failed_job_is_identifiable_and_stops_remaining_migrations(capsys):
     assert '"job_id": "bdc_release_' in output
     assert 'private provider detail' not in output
     assert '"completed": true' not in output
+
+
+def test_integrity_failure_blocks_release_after_ddl(capsys):
+    client=migration_client()
+    client.query.return_value.result.side_effect=[None,None,None,None,[{'orphan_user':1}]]
+    with pytest.raises(RuntimeError,match='model_integrity_failed'):
+        apply_models(client,load_config(ROOT/'config/project.json'))
+    assert '"quality_passed": false' in capsys.readouterr().out

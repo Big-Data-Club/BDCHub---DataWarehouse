@@ -20,9 +20,16 @@ Recommender, and MCP:
 `asia-southeast1`, with billing disabled at the owner's request. Five datasets,
 one raw LMS table, and four logical staging/core/mart/quality views were deployed
 and verified on 2026-10-21. Source capture and batch-load commands are implemented;
-the first real batch of 205 LMS events has been loaded and reconciled. Recurring
-ingestion, historical backfill, and a persistent SCD2 model are not deployed. See
-[observed deployment evidence](docs/deployment-status.md).
+the first real batch of 205 LMS events has been loaded and reconciled. Continuous
+ingestion was subsequently deployed through production CI/CD; see the
+[runtime receipt](../docs/warehouse-production-status.md). Historical backfill
+and persistent SCD2 history are not complete.
+
+The foundation code adds a versioned platform envelope, multi-topic Kafka
+collection, consistent source-owned AI usage snapshots, inferred conformed
+dimensions, three separate-grain stars and aggregate quality analysis. Use the
+receipt to distinguish implemented code from the deployed revision. New data
+marts, dashboards and DSS/recommendation serving are deliberately deferred.
 
 The active [billing-disabled decision](../docs/adr/2026-10-21-bigquery-billing-disabled-foundation.md)
 supersedes ADR-001's billing assumption for this project. Resources expire under
@@ -44,6 +51,8 @@ implemented analytics/profile boundary. See the
 | [BigQuery setup](docs/05-bigquery-setup.md) | Active project, authentication, deployment, real source capture, and recovery |
 | [Engineering optimization](docs/06-data-engineering-optimization.md) | Measurement, ingestion, SQL, storage, and recovery trade-offs |
 | [Continuous deployment](docs/07-continuous-deployment.md) | Keyless identities, durable worker, CI/CD, retries, and runtime verification |
+| [Foundation design](docs/08-foundation-design.md) | Business scope, source discovery, contracts, privacy, future consumers and acceptance |
+| [Implemented dimensional model](docs/09-dimensional-model-implementation.md) | Bus matrix, grains/keys, inferred dimensions, additivity, SCD boundaries and lineage |
 
 For agent-assisted design and implementation, use the repository
 [`bdc-data-engineering` skill](../.agents/skills/bdc-data-engineering/SKILL.md).

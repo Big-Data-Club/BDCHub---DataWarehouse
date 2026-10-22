@@ -24,8 +24,19 @@ CREATE TABLE IF NOT EXISTS batches (
  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE TABLE IF NOT EXISTS counters (day TEXT PRIMARY KEY, load_attempts INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 ''')
         self.db.commit()
+
+    def bind_stream(self, identity, allow_legacy=False):
+        row=self.db.execute("SELECT value FROM metadata WHERE key='stream_identity'").fetchone()
+        if row and row[0]!=identity:
+            raise RuntimeError('journal_belongs_to_different_stream_or_target')
+        if row is None:
+            if self.pending() and not allow_legacy:
+                raise RuntimeError('unbound_pending_journal_requires_operator_recovery')
+            with self.db:
+                self.db.execute("INSERT INTO metadata VALUES ('stream_identity',?)",(identity,))
 
     def pending(self):
         row=self.db.execute('SELECT job_id,payload,row_count,next_offsets,acknowledged FROM batches ORDER BY created_at,job_id LIMIT 1').fetchone()

@@ -29,6 +29,20 @@ MODELS = (
     ('core', 'fact_content_interaction', 'VIEW'),
     ('mart', 'mart_course_daily_activity', 'VIEW'),
     ('governance', 'lms_identity_conflicts', 'VIEW'),
+    ('raw','platform_events','TABLE'),
+    ('staging','platform_events','VIEW'),
+    ('staging','learning_events','VIEW'),
+    ('governance','platform_identity_conflicts','VIEW'),
+    ('governance','learning_identity_conflicts','VIEW'),
+    ('core','fact_learning_activity','VIEW'),
+    ('core','fact_recommendation_event','VIEW'),
+    ('core','fact_llm_attempt','VIEW'),
+    ('core','dim_user','VIEW'),
+    ('core','dim_course','VIEW'),
+    ('core','dim_feature','VIEW'),
+    ('core','dim_date','VIEW'),
+    ('core','dim_time','VIEW'),
+    ('core','dim_ai_model','VIEW'),
 )
 
 
@@ -203,7 +217,8 @@ def main():
     args = parser.parse_args()
     try:
         config = load_config(args.config)
-        files = (ROOT/'ddl/001_foundation.sql', ROOT/'transforms/001_lms_views.sql')
+        files = (ROOT/'ddl/001_foundation.sql',ROOT/'ddl/003_platform_events.sql',
+                 ROOT/'transforms/001_lms_views.sql',ROOT/'transforms/002_platform_core.sql')
         if args.command == 'render':
             print('\n'.join(render_sql(config, path) for path in files))
             return

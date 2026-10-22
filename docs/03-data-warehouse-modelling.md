@@ -2,10 +2,15 @@
 
 Owner: BDC Hub platform/data team, with domain owners defining business semantics.
 Status: target model; tables below are planned unless implementation is linked.
+The executable foundation now defines learning/recommendation/LLM-attempt stars
+and inferred dimensions in [the implementation guide](09-dimensional-model-implementation.md).
+That guide is authoritative for implemented grains and unknown fields; this
+catalog describes the broader target, including deferred data marts.
 
-The initial implementation is a typed raw LMS table and logical
+The original implementation is a typed raw LMS table and logical
 [staging/fact/mart/quality views](../transforms/001_lms_views.sql). It preserves
-source keys and does not create the planned dimensions or persisted SCD2 history.
+source keys. The extended foundation adds observed conformed dimensions and
+separate learning/recommendation/AI stars; persisted SCD2 history remains planned.
 The [current setup](05-bigquery-setup.md) describes the billing-disabled constraints.
 
 ## 1. Modelling method
