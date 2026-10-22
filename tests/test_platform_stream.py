@@ -38,7 +38,9 @@ async def test_commit_only_acked_topic_and_rewind_overfetched_other_topic(tmp_pa
               table_expires=datetime.now(timezone.utc)+timedelta(days=1),acknowledge=Mock(return_value=1))
     with patch.object(main,'AIOKafkaConsumer',return_value=consumer),patch.object(main,'BigQuerySink',return_value=sink):
         with patch.object(main,'source_partitions',new=AsyncMock(return_value=[0])):
-            task=asyncio.create_task(main.run(stop=stop))
+            # Reproduce a newly booted CI/node clock below sixty seconds. The
+            # first upload must not inherit an artificial pacing delay.
+            task=asyncio.create_task(main.run(stop=stop,clock=lambda:5.0))
             await asyncio.wait_for(task,timeout=5)
     consumer.commit.assert_awaited_once()
     assert consumer.seek.call_args_list[-2].args==(learning,1)

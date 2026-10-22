@@ -76,7 +76,7 @@ class Health(BaseHTTPRequestHandler):
         pass
 
 
-async def run(stop=None):
+async def run(stop=None,clock=time.monotonic):
     logging.getLogger('aiokafka').setLevel(logging.CRITICAL)
     interval = int(os.environ.get('FLUSH_INTERVAL_SECONDS','300'))
     max_records = int(os.environ.get('BATCH_MAX_RECORDS','1000'))
@@ -157,7 +157,9 @@ async def run(stop=None):
         STATE['ready']=True
         emit('worker_started',topics=sorted({p.topic for p in assigned}),stream=stream,
              partitions=len(assigned),flush_seconds=interval,version=STATE['version'])
-        last_upload=0.0
+        # No prior upload exists at startup. Monotonic zero is a real instant
+        # on a newly booted host, not a sentinel for "never uploaded".
+        last_upload=None
         last_lag=0.0
 
         async def flush_pending():
@@ -168,7 +170,7 @@ async def run(stop=None):
             # After restart or ambiguous ack, inspect this identical job before
             # any new fetch; never derive a new job ID for the same stored batch.
             if not batch['acknowledged']:
-                remaining=60-(time.monotonic()-last_upload)
+                remaining=0 if last_upload is None else max(0,60-(clock()-last_upload))
                 if remaining>0:
                     await asyncio.sleep(remaining)
                 # SQLite is owned by this thread. The SDK upload runs in a
@@ -180,7 +182,7 @@ async def run(stop=None):
                     asyncio.run_coroutine_threadsafe(reserve_slot(),loop).result(timeout=10)
                 rows=await asyncio.to_thread(sink.acknowledge,batch,journal.root,before_submit)
                 journal.acknowledge(batch['job_id'])
-                last_upload=time.monotonic()
+                last_upload=clock()
                 STATE['last_ack']=datetime.now(timezone.utc).isoformat()
                 STATE['acknowledged_rows']+=rows
                 STATE['successful_batches']+=1
